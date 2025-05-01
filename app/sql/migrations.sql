@@ -78,8 +78,8 @@ CREATE TABLE IF NOT EXISTS order_details (
     adx REAL NOT NULL,
     mfi REAL NOT NULL,
     timestamp TIMESTAMP NOT NULL,
-    status TEXT DEFAULT 'OPEN'
-    trade_type TEXT DECIMAL 'BUY'
+    status TEXT DEFAULT 'OPEN',
+    trade_type TEXT DEFAULT 'BUY'
 );
 
 -- Get profit and loss
