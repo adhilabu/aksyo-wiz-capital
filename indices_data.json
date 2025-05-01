@@ -1,0 +1,16 @@
+{
+  "NIFTY AUTO": "https://www.niftyindices.com/IndexConstituent/ind_niftyautolist.csv",
+  "BANKNIFTY": "https://www.niftyindices.com/IndexConstituent/ind_niftybanklist.csv",
+  "NIFTY FMCG": "https://www.niftyindices.com/IndexConstituent/ind_niftyfmcglist.csv",
+  "NIFTY HEALTHCARE": "https://www.niftyindices.com/IndexConstituent/ind_niftyhealthcarelist.csv",
+  "NIFTY IT": "https://www.niftyindices.com/IndexConstituent/ind_niftyitlist.csv",
+  "NIFTY MEDIA": "https://www.niftyindices.com/IndexConstituent/ind_niftymedialist.csv",
+  "NIFTY METAL": "https://www.niftyindices.com/IndexConstituent/ind_niftymetallist.csv",
+  "NIFTY PHARMA": "https://www.niftyindices.com/IndexConstituent/ind_niftypharmalist.csv",
+  "NIFTY REALTY": "https://www.niftyindices.com/IndexConstituent/ind_niftyrealtylist.csv",
+  "NIFTY CONSR DURBL": "https://www.niftyindices.com/IndexConstituent/ind_niftyconsumerdurableslist.csv",
+  "NIFTY OIL AND GAS": "https://www.niftyindices.com/IndexConstituent/ind_niftyoilgaslist.csv",
+  "NIFTY MS FIN SERV": "https://www.niftyindices.com/IndexConstituent/ind_niftymidsmallfinancailservice_list.csv",
+  "NIFTY MIDSML HLTH": "https://www.niftyindices.com/IndexConstituent/ind_niftymidsmallhealthcare_list.csv",
+  "NIFTY MS IT TELCM": "https://www.niftyindices.com/IndexConstituent/ind_niftymidsmallitAndtelecom_list.csv"
+}
