@@ -3,12 +3,15 @@ import asyncio
 import json
 import os
 from typing import Any, List, Optional, Dict
+
+import pytz
 from app.database.db import DBConnection
 from app.capital.capital_com import CapitalComAPI
 from app.capital.schemas import BasicPlaceOrderCapital, CapitalOrderType, CapitalTransactionType, CapitalMarketResolution
 from datetime import datetime
 import pandas as pd
 import logging
+import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
@@ -102,20 +105,16 @@ class CapitalAPI:
         df = df[[	'stock	', 	'open	', 	'high	', 	'low	', 	'close	', 	'volume	', 	'open_interest	', 	'timestamp	', 	'ltp	']]
         return df
 
-    async def get_historical_data(self, epic: str, start_date: str, end_date: str, interval: str = 	'1minute	') -> pd.DataFrame:
-        """Fetch and transform historical price data from Capital.com API."""
+    async def get_recent_data(self, epic: str, start_dt_str: str, end_dt_str: str, interval: str = 	'1minute') -> pd.DataFrame:
+        """Fetch and transform recent price data from Capital.com API."""
         resolution = self._map_interval_to_resolution(interval)
-        # Ensure start_date and end_date are in the correct format (e.g., YYYY-MM-DDTHH:MM:SS)
-        # Assuming input dates are strings like 'YYYY-MM-DD'
-        start_dt_str = f"{start_date}T00:00:00"
-        end_dt_str = f"{end_date}T23:59:59"
         
         request_payload = {
             "epic": epic,
             "resolution": resolution.value,
-            "from": start_dt_str,
-            "to": end_dt_str,
-            "max": 1000 # Adjust max_bars as needed, Capital.com might have limits
+            "from_date": start_dt_str,
+            "to_date": end_dt_str,
+            "max_bars": 1000 # Adjust max_bars as needed, Capital.com might have limits
         }
         
         try:
@@ -136,12 +135,15 @@ class CapitalAPI:
             # await self.log_request_response(f"/api/v1/prices/{epic}", request_payload, {"error": str(e)}, 500)
             return pd.DataFrame()
 
-    async def get_current_trading_day_data(self, epic: str, interval: str = 	'1minute	') -> pd.DataFrame:
+    async def get_current_trading_day_data(self, epic: str, interval: str = '1minute') -> pd.DataFrame:
         """Fetch intraday data for the current day."""
-        # Use get_historical_data with today's date range
-        today_str = datetime.utcnow().strftime(	'%Y-%m-%d	')
-        logger.info(f"Fetching current trading day data for {epic} ({today_str}) with interval {interval}")
-        return await self.get_historical_data(epic, today_str, today_str, interval)
+        # end_dt_str = datetime.now().replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
+        # start_dt_str = (datetime.now() - pd.Timedelta(minutes=900)).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
+        # Rewrite both in UTC
+        end_dt_str = datetime.now(pytz.UTC).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
+        start_dt_str = (datetime.now(pytz.UTC) - pd.Timedelta(minutes=900)).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
+        logger.info(f"Fetching current trading day data for {epic} ({end_dt_str}) - ({start_dt_str}) with interval {interval}")
+        return await self.get_recent_data(epic, start_dt_str, end_dt_str, interval)
 
     def get_market_holidays(self):
         """Fetch market holidays. Capital.com might not have a direct equivalent. Find alternative source or omit."""
@@ -445,3 +447,38 @@ class CapitalAPI:
             return []
 
 
+    def get_historical_data(self, instruments):
+        """
+        Fetches 1-minute historical candle data for the given list of instruments using yfinance.
+        
+        Args:
+            instruments (str): Comma-separated string of instrument symbols.
+            
+        Returns:
+            dict: A dictionary where keys are instrument symbols and values are pandas DataFrames with OHLC data.
+        """
+        symbol_map = {
+            'ETHUSD': 'ETH-USD',
+            'EURUSD': 'EURUSD=X',
+            'USDJPY': 'USDJPY=X',
+            'J225': '^N225',
+            'US30': '^DJI',
+            'BTCUSD': 'BTC-USD'
+        }
+        
+        data = {}
+        for symbol in instruments:
+            # Get the corresponding Yahoo Finance ticker symbol
+            ticker = symbol_map.get(symbol, symbol)  # Fallback to the original symbol if not found
+            
+            try:
+                # Fetch 1-minute data for the last 7 days (max allowed by Yahoo Finance for 1m interval)
+                df = yf.download(ticker, period='7d', interval='1m')
+                if df.empty:
+                    print(f"No data found for {symbol} (ticker: {ticker})")
+                else:
+                    data[symbol] = df
+            except Exception as e:
+                print(f"Error fetching data for {symbol} (ticker: {ticker}): {e}")
+        
+        return data

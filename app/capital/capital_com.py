@@ -26,7 +26,7 @@ class CapitalComAPI:
         api_password: Optional[str] = None,
         base_url: Optional[str] = None,
         streaming_url: Optional[str] = None,
-        is_encrypted_password: bool = False
+        is_encrypted_password: bool = True
     ):
         self.api_key = api_key or CAPITAL_SETTINGS.CAPITAL_API_KEY
         self.api_identifier = api_identifier or CAPITAL_SETTINGS.CAPITAL_API_IDENTIFIER

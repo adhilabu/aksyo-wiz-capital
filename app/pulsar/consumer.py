@@ -5,7 +5,7 @@ from _pulsar import ConsumerType
 import json
 import traceback
 from app.analyse.analyse import StockIndicatorCalculator
-from app.analyse.transform import filter_data_by_interval, transform_data
+from app.analyse.transform import transform_capital_ohlc
 from app.database.db import DBConnection
 from app.redis.redis import RedisCache
 
@@ -98,10 +98,10 @@ class PulsarConsumer:
             data = json.loads(msg.data().decode("utf-8"))
             self.consumer.acknowledge(msg)
 
-            if not filter_data_by_interval(data):
-                return
+            # if not filter_data_by_interval(data):
+            #     return
 
-            transformed_data = transform_data(data)
+            transformed_data = transform_capital_ohlc(data)
             if transformed_data.empty:
                 return
 

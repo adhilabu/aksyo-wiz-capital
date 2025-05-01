@@ -68,7 +68,7 @@ def transform_data(json_data) -> pd.DataFrame:
                 timestamp = datetime.fromtimestamp(int(market_data.get("ts")) / 1000, tz=timezone.utc).astimezone(pytz.timezone("Asia/Kolkata"))
                 if timestamp < timestamp.replace(hour=9, minute=15):
                     continue
-                
+
                 data = {
                     "stock": stock_key,
                     "interval": market_data.get("interval"),
@@ -88,6 +88,40 @@ def transform_data(json_data) -> pd.DataFrame:
 
     transformed_data = pd.DataFrame(data_list)
     return transformed_data
+
+
+def transform_capital_ohlc(json_data) -> pd.DataFrame:
+    """
+    Transforms a Capital.com WebSocket OHLC message into a structured Pandas DataFrame.
+    """
+    try:
+        payload = json_data.get("payload", {})
+        if not payload:
+            return pd.DataFrame()  # Return empty DataFrame if payload is missing
+
+        utc_dt = datetime.fromtimestamp(payload["t"] / 1000, tz=timezone.utc)
+        ist_dt = utc_dt.astimezone(pytz.timezone("Asia/Kolkata"))
+
+        data = {
+            "stock": payload.get("epic"),
+            "type": payload.get("type"),
+            "price_type": payload.get("priceType"),
+            "resolution": payload.get("resolution"),
+            "timestamp": ist_dt.replace(tzinfo=None),  # Remove timezone info for consistency
+            "open": payload.get("o"),
+            "high": payload.get("h"),
+            "low": payload.get("l"),
+            "close": payload.get("c"),
+            "volume": int(payload.get("vol", 0)),
+            "ltp": payload.get("ltp"),
+            "open_interest": payload.get("openInterest", 0)            
+        }
+
+        return pd.DataFrame([data])
+
+    except Exception as e:
+        print(f"Error transforming data: {e}")
+        return pd.DataFrame()
 
 
 # def transform_data_temp(json_data) -> pd.DataFrame:

@@ -8,7 +8,7 @@ import websockets
 from app.redis.redis import RedisCache # Assuming RedisCache is still used
 from app.pulsar.producer import PulsarProducer # Assuming PulsarProducer is still used
 from app.capital.capital_com import CapitalComAPI
-from app.capital.instruments import get_epics_for_strategy # Use the new instrument function
+from app.capital.instruments import get_capital_epics, get_epics_for_strategy # Use the new instrument function
 # from app.capital.schemas import CapitalWebSocketMessage # Import schema for parsing messages
 
 # Determine which set of EPICs to subscribe to based on environment variable or config
@@ -19,32 +19,15 @@ async def process_websocket_message(message: str, producer: PulsarProducer):
     """Processes a raw message from the WebSocket and sends it to Pulsar."""
     try:
         data_dict = json.loads(message)
-        
-        # TODO: Parse the data_dict based on Capital.com's streaming format.
-        # The format might include market updates, price changes, etc.
-        # Example structure (needs verification based on actual API response):
-        # { "epic": "US500", "updateTimeUTC": ..., "bid": ..., "ask": ... }
-        
-        # Filter or transform the message if needed before sending to Pulsar
-        # Example: Only send price updates, not heartbeats
-        if data_dict.get("destination") == "marketData.update": # Check actual destination/type field
-            payload = data_dict.get("payload", {})
-            # Add strategy type or other relevant info if needed
-            payload["strategy_type"] = STRATEGY_TYPE 
-            
-            # Parse using Pydantic schema if defined
-            # parsed_message = CapitalWebSocketMessage(**payload)
-            # producer.send_message(parsed_message.model_dump_json())
-            
-            # Or send raw payload
+        if data_dict.get("destination") == "destination": # Check actual destination/type field
+            payload = data_dict.get("payload", {})            
             producer.send_message(json.dumps(payload))
-            # print(f"Sent message for {payload.get(\'epic\')}") # Optional logging
+
         elif data_dict.get("destination") == "ping":
-            # Handle ping/pong or heartbeats if necessary
             pass
+
         else:
-            # Log unexpected messages
-            # print(f"Received unexpected message: {data_dict}")
+            print(f"Received unexpected message: {data_dict}")
             pass
             
     except json.JSONDecodeError:
@@ -65,28 +48,8 @@ async def capital_websocket_listener(producer: PulsarProducer):
                 print("Failed to establish API session. Retrying in 60 seconds...")
                 await asyncio.sleep(60)
                 continue
-                
-            # Connect to WebSocket using the client method
-            # The client method handles authentication during connection
-            # websocket = await api_client.connect_websocket() # Original client method might subscribe during connect
-            
-            # Alternative: Manually connect and authenticate if client method doesn't fit
             websocket = await websockets.connect(api_client.streaming_url)
-            auth_message = {
-                "destination": "session.logon", # Check correct destination for auth
-                "cst": api_client.cst,
-                "securityToken": api_client.security_token,
-                "correlationId": str(uuid.uuid4()) # Unique correlation ID
-            }
-            await websocket.send(json.dumps(auth_message))
-            auth_response = await websocket.recv()
-            print(f"WebSocket Auth Response: {auth_response}")
-            if json.loads(auth_response).get("status") != "OK":
-                 raise Exception(f"WebSocket authentication failed: {auth_response}")
-            print("WebSocket connection established and authenticated.")
-
-            # Get the list of EPICs to subscribe to based on the strategy type
-            epics_to_subscribe = await get_epics_for_strategy(STRATEGY_TYPE)
+            epics_to_subscribe = get_capital_epics()
             
             if not epics_to_subscribe:
                 print(f"No EPICs found for strategy type 	'{STRATEGY_TYPE}	'. Waiting...")
@@ -100,12 +63,16 @@ async def capital_websocket_listener(producer: PulsarProducer):
             for i in range(0, len(epics_to_subscribe), batch_size):
                 batch = epics_to_subscribe[i:i + batch_size]
                 subscription_message = {
-                    "destination": "marketData.subscribe",
+                    "destination": "OHLCMarketData.subscribe",
                     "correlationId": str(uuid.uuid4()),
                     "cst": api_client.cst, # Include tokens if required per message
                     "securityToken": api_client.security_token,
                     "payload": {
-                        "epics": batch
+                        "epics": batch,
+                        "resolutions": [
+                            "MINUTE"
+                        ],
+                        "type": "classic"
                     }
                 }
                 await websocket.send(json.dumps(subscription_message))
@@ -135,12 +102,3 @@ async def capital_websocket_listener(producer: PulsarProducer):
                     pass # Ignore errors during close
             websocket = None
             await asyncio.sleep(30)
-
-# Example usage (similar to how the old feed.py might have been called)
-# if __name__ == "__main__":
-#     # Initialize Pulsar producer
-#     pulsar_producer = PulsarProducer()
-#     # Start the WebSocket listener
-#     asyncio.run(capital_websocket_listener(pulsar_producer))
-
-

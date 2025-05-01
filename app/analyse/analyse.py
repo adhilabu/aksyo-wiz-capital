@@ -56,20 +56,8 @@ class StockIndicatorCalculator:
         self.end_date = end_date
         self.test_mode = test_mode
         self.capital_client = CapitalAPI(db_conn=db_connection)
-        # Instrument handling needs update for Capital.com EPICs
         self.epics = get_capital_epics() # Assuming get_capital_epics exists and returns list of EPICs
-        # self.stock_name_map = get_stock_instrument_name_map(self.stocks) # Needs Capital.com equivalent if used
-        # self.stock_name_map = {epic: epic for epic in self.epics} # Simple map for now
         self.filename = self.get_notes_filename()
-        # self.indices_stocks_map, self.stock_index_map = get_indices_stocks_map() # Needs Capital.com equivalent
-        # Placeholder for index mapping if needed
-        # self.indices_epics_map = {} # e.g., {"IX.D.NIFTY.DAILY.IP": ["EPIC1", "EPIC2"]}
-        # self.epic_index_map = {} # e.g., {"EPIC1": "IX.D.NIFTY.DAILY.IP"}
-        # Update NIFTY_50_SYMBOL if needed for Capital.com
-        # NIFTY_50_SYMBOL = "IX.D.NIFTY.DAILY.IP" # Example EPIC for Nifty 50
-
-        self.trade_analysis_type = TRADE_ANALYSIS_TYPE
-        self.stock_train_data_map: dict[str, Any] = {}
         self.stock_reversal_data: dict[str, Any] = {}  # {stock_symbol: (high, low, timestamp)}
         self.index_reversal_data: dict[str, Any] = {}  # {index_symbol: (high, low, timestamp)}
         self.executed_breakouts = {}
@@ -92,9 +80,7 @@ class StockIndicatorCalculator:
     
     async def initialize_historical_data(self):
         start_time = datetime.now()
-        # await self.fetch_historical_data()
-        # await self.fetch_historical_data_day(self.end_date)
-        await self.db_con.delete_existing_index_data()
+        await self.process_combined_stock_data()
         end_time = datetime.now()
         self.logger.info(f"Data initialized in {end_time - start_time} seconds.")
 
@@ -129,78 +115,6 @@ class StockIndicatorCalculator:
 
         await self.analyze_reversal_breakout_strategy(stock)
         return
-    
-    def check_the_date_is_weekend(self, date_str: str) -> bool:
-        date = datetime.strptime(date_str, "%Y-%m-%d")
-        return date.weekday() in [5, 6]
-    
-    def load_cache(self):
-        """Loads the cached holidays data from the file."""
-        if os.path.exists(self.CACHE_FILE):
-            with open(self.CACHE_FILE, 'r') as f:
-                return json.load(f)
-        return []
-
-    def save_cache(self, holidays):
-        """Saves the holidays data to the cache file."""
-        with open(self.CACHE_FILE, 'w') as f:
-            json.dump(holidays, f)
-    
-    def check_the_date_is_holiday(self, date_str: str) -> bool:
-        market_holidays = self.load_cache()
-        if not market_holidays:
-            market_holidays = [
-                "2024-01-26",
-                "2024-03-08",
-                "2024-03-29",
-                "2024-04-19",
-                "2024-05-01",
-                "2024-08-15",
-                "2024-08-22",
-                "2024-09-05",
-                "2024-10-02",
-                "2024-10-08",
-                "2024-10-27",
-                "2024-10-28",
-                "2024-11-12",
-                "2024-12-25",
-                "2024-11-15",
-                "2024-11-20",
-            ]
-        
-            cy_holidays_data = self.capital_client.get_market_holidays() # Capital.com might not support this
-            # Assuming cy_holidays_data is a list of date strings if supported, else empty
-            cy_holidays = cy_holidays_data if isinstance(cy_holidays_data, list) else [] 
-            # cy_holidays = [data.get("date") for data in cy_holidays_data.get("data", [])] # Original Upstox structure
-
-            market_holidays.extend(cy_holidays)
-            self.save_cache(market_holidays)
-        
-        return date_str in market_holidays
-
-    def get_missing_dates(self, start_date: str, end_date: str, cached_data: pd.DataFrame) -> list:
-        date_range = pd.date_range(start=start_date, end=end_date)
-        cached_dates = pd.to_datetime(cached_data['timestamp']).dt.date.unique() if not cached_data.empty else []
-        missing_dates = [d.strftime("%Y-%m-%d") for d in date_range if d.date() not in cached_dates]
-        if not missing_dates:
-            return missing_dates
-        
-        valid_missing_date = []
-        for date in missing_dates:
-            if self.check_the_date_is_weekend(date) or self.check_the_date_is_holiday(date):
-                continue
-            valid_missing_date.append(date)
-        return valid_missing_date
-    
-    def is_trading_day(self, date_str: str = None) -> bool:
-        if not date_str:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-        return not self.check_the_date_is_weekend(date_str) and not self.check_the_date_is_holiday(date_str)
-    
-    def is_current_day_and_trading_day(self, date_str: str = None) -> bool:
-        if not date_str:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-        return date_str == datetime.now().strftime("%Y-%m-%d") and self.is_trading_day(date_str)
 
     def apply_tick_size(self, price: float) -> float:
         """Round the price down to the nearest tick size."""
@@ -242,118 +156,23 @@ class StockIndicatorCalculator:
         data['stock'] = stock
         return data
     
-    async def process_stock_data(self, stock, start_date, end_date, is_trading_day, current_time):
-        """
-        Asynchronous helper function to fetch and process data for a single stock.
-        """
-        self.logger.info(f"Fetching historical data for stock: {stock}.")
-        cached_data = await self.db_con.load_data_from_db(stock, start_date, end_date)
-        missing_dates = self.get_missing_dates(start_date, end_date, cached_data)
-        
-        # Handle current day trading data if applicable
-        if is_trading_day and current_time.hour >= 9 and not self.test_mode:
-            await self.db_con.delete_data_from_db(stock)
-            current_day_data_df = await self.capital_client.get_current_trading_day_data(stock)
-            # current_day_td_data = await self.transform_candle_data_to_df(stock, current_day_data) # Transformation now happens in actions.py
-            await self.db_con.save_data_to_db(current_day_data_df)
+    async def process_combined_stock_data(self):
+        for stock in self.epics:
+            current_day_data = await self.capital_client.get_current_trading_day_data(stock)
+            # await self.calculate_pivot_data(combined_data)
+            await self.db_con.save_data_to_db(current_day_data)
 
-        # If no missing dates, calculate pivot data and exit
-        if not missing_dates:
-            await self.calculate_pivot_data(cached_data)
-            self.logger.info(f"Data already exists for stock: {stock}.")
-            return
-
-        # Fetch historical data for missing dates
-        missing_start_date = min(missing_dates)
-        missing_end_date = max(missing_dates)
-        stock_data_df = await self.capital_client.get_historical_data(stock, missing_start_date, missing_end_date)
-        # transformed_data = await self.transform_candle_data_to_df(stock, stock_data) # Transformation now in actions.py
-        await self.calculate_pivot_data(stock_data_df)
-        await self.db_con.save_data_to_db(stock_data_df)
-        self.logger.info(f"Data fetched for stock: {stock}.")
-
-    async def fetch_historical_data(self, batch_size=50):
-        """
-        Main function to fetch and process historical data for multiple stocks asynchronously, in batches.
-        """
-        
-        start_date, end_date = self.set_and_get_dates(for_historical_data=True)
-        is_trading_day = self.is_trading_day()
-        current_time = datetime.now(pytz.timezone('Asia/Kolkata')).time()
-        batches = [self.stocks[i:i + batch_size] for i in range(0, len(self.stocks), batch_size)]
-        update_start_time = datetime.now()
-        for batch in batches:
-            tasks = [
-                self.process_stock_data(
-                    stock, start_date, end_date, is_trading_day, current_time,
-                )
-                for stock in batch
-            ]
-            await asyncio.gather(*tasks)
-            await asyncio.sleep(1)
-        update_end_time = datetime.now()
-        self.logger.info(f"Fetched historical data and inserted in {update_end_time - update_start_time} seconds.")
-
-
-    async def process_stock_for_day(self, stock, date, is_trading_day):
-        """
-        Processes historical data for a single stock on a specific date.
-        """
-        try:
-            await self.db_con.delete_data_from_db(stock, date)
-            
-            # Fetch historical or current day data using CapitalAPI
-            stock_data_df = await self.capital_client.get_historical_data(stock, date.strftime("%Y-%m-%d"), date.strftime("%Y-%m-%d"))
-            if stock_data_df.empty and is_trading_day:
-                stock_data_df = await self.capital_client.get_current_trading_day_data(stock)
-            elif stock_data_df.empty:
-                self.logger.info(f"Data not available for stock: {stock} on date: {date}.")
-                return pd.DataFrame()
-
-            # Transform data to a DataFrame (already done in actions.py)
-            # transformed_data = await self.transform_candle_data_to_df(stock, stock_data)
-            transformed_data = self.clean_empty_columns(stock_data_df) # Clean if needed
-            self.logger.info(f"Data processed for stock: {stock}.")
-            return transformed_data
-        except Exception as e:
-            self.logger.error(f"Error processing data for stock: {stock}. Error: {e}")
-            return pd.DataFrame()
-
-    async def fetch_historical_data_day(self, date: date, batch_size=100) -> pd.DataFrame:
-        """
-        Fetches and processes historical data for all stocks on a specific date.
-
-        Parameters:
-        - date (date): Date for which data needs to be fetched.
-        - batch_size (int): Number of stocks to process concurrently in each batch.
-
-        Returns:
-        - pd.DataFrame: Combined DataFrame of all transformed data.
-        """
-        is_trading_day = self.is_current_day_and_trading_day(date.strftime("%Y-%m-%d"))
-        combined_transformed_data = pd.DataFrame()
-        batches = [self.stocks[i:i + batch_size] for i in range(0, len(self.stocks), batch_size)]
-
-        for batch in batches:
-            tasks = [
-                self.process_stock_for_day(
-                    stock, date, is_trading_day
-                )
-                for stock in batch
-            ]
-
-            results = await asyncio.gather(*tasks)
-            for result in results:
-                if not result.empty:
-                    combined_transformed_data = (
-                        result
-                        if combined_transformed_data.empty
-                        else pd.concat([combined_transformed_data, result], ignore_index=True)
-                    )
-
-            await asyncio.sleep(1)
-
-        return combined_transformed_data
+    # async def process_combined_stock_data(self):
+    #     historical_data_map = self.capital_client.get_historical_data(self.epics)
+    #     for stock in self.epics:
+    #         if stock in historical_data_map:
+    #             current_day_data = await self.capital_client.get_current_trading_day_data(stock)
+    #             historical_data = historical_data_map[stock]
+    #             combined_data = pd.concat([historical_data, current_day_data], ignore_index=True)
+    #             await self.calculate_pivot_data(combined_data)
+    #             await self.db_con.save_data_to_db(combined_data)
+    #         else:
+    #             self.logger.warning(f"No historical data found for stock: {stock}.")
 
     async def calculate_mfi_talib(self, stock_data: pd.DataFrame, period=14) -> np.float64:
         if len(stock_data) <= 14:
@@ -473,13 +292,12 @@ class StockIndicatorCalculator:
 
     async def check_and_execute_exit_trade_type_2(self, stock_data: pd.DataFrame):
         """Check and execute exit conditions for open trades based on strategy type 2."""
-        current_timestamp = stock_data[	'timestamp	']
-        stock = stock_data[	'stock	'] # EPIC
-        current_ltp = stock_data[	'ltp	']
-        current_close = stock_data[	'close	']
-        current_low = stock_data[	'low	']
-        current_high = stock_data[	'high	']
-        stock_name = self.stock_name_map.get(stock, stock)
+        current_timestamp = stock_data['timestamp']
+        stock = stock_data['stock'] # EPIC
+        current_ltp = stock_data['ltp']
+        current_close = stock_data['close']
+        current_low = stock_data['low']
+        current_high = stock_data['high']
 
         # Fetch open trades (assuming DB stores dealId or dealReference)
         open_trades: list[Trade] = await self._fetch_open_trades(stock, current_timestamp)
@@ -498,13 +316,13 @@ class StockIndicatorCalculator:
                 confirmed = False
                 if trade.deal_reference: # Check confirmation using reference
                     confirmation = await self.capital_client.get_confirmation(trade.deal_reference)
-                    if confirmation and confirmation.get(	'dealStatus	') == 	'ACCEPTED	':
-                        trade.deal_id = confirmation.get(	'dealId	') # Get the actual dealId
+                    if confirmation and confirmation.get('dealStatus') == 'ACCEPTED':
+                        trade.deal_id = confirmation.get('dealId')
                         trade.order_status = True
                         confirmed = True
                         # Update DB with dealId and status
                         await self.db_con.update_trade_confirmation(trade.id, trade.deal_id, True)
-                    elif confirmation and confirmation.get(	'dealStatus	') == 	'REJECTED	':
+                    elif confirmation and confirmation.get('dealStatus') == 'REJECTED':
                         # Handle rejection - update DB to closed/failed status
                         await self.db_con.update_trade_status(trade.id, TradeStatus.FAILED, current_ltp, current_ltp)
                         continue # Move to next trade
@@ -546,7 +364,7 @@ class StockIndicatorCalculator:
                             # Update DB status
                             executed_trades_updates.append((
                                 status.value, trade.id, current_ltp,
-                                exit_price, stock_name # stock_name might not be needed here
+                                exit_price, stock
                             ))
                         else:
                             self.logger.error(f"Failed to execute exit for trade {trade.id} (Deal ID: {trade.deal_id})")
@@ -581,21 +399,21 @@ class StockIndicatorCalculator:
 
         rows = await self.db_con.fetch_open_orders(stock, timestamp) # Assuming this query returns deal_id and deal_reference
         return [Trade(
-            id=row[	'id	'],
+            id=row[	'id'],
             stock=stock, # EPIC
-            entry_ltp=row[	'ltp	'],
-            entry_cp=row[	'cp	'],
-            entry_price=row[	'entry_price	'],
-            sl=row[	'sl	'],
-            pl=row[	'pl	'],
-            entry_time=row[	'timestamp	'],
-            trade_type=row[	'trade_type	'], # Ensure this maps to CapitalTransactionType
+            entry_ltp=row[	'ltp'],
+            entry_cp=row[	'cp'],
+            entry_price=row[	'entry_price'],
+            sl=row[	'sl'],
+            pl=row[	'pl'],
+            entry_time=row[	'timestamp'],
+            trade_type=row[	'trade_type'], # Ensure this maps to CapitalTransactionType
             tag=f"{stock}_tag", # Tag concept needs review for Capital.com
-            metadata_json=json.loads(row[	'metadata_json	']) if row[	'metadata_json	'] else {},
+            metadata_json=json.loads(row[	'metadata_json']) if row[	'metadata_json'] else {},
             order_ids=[], # Deprecated, use deal_id/deal_reference
             deal_id=row.get(	'deal_id	'), # Fetch from DB
             deal_reference=row.get(	'deal_reference	'), # Fetch from DB
-            order_status=row[	'order_status	'],
+            order_status=row[	'order_status'],
         ) for row in rows] if rows else []
 
     async def _adjust_sl_pl(
