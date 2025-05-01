@@ -9,7 +9,7 @@ import base64
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
-from app.shared.config.settings import settings
+from app.shared.config.settings import CAPITAL_SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +28,11 @@ class CapitalComAPI:
         streaming_url: Optional[str] = None,
         is_encrypted_password: bool = False
     ):
-        self.api_key = api_key or settings.CAPITAL_API_KEY
-        self.api_identifier = api_identifier or settings.CAPITAL_API_IDENTIFIER
-        self.api_password = api_password or settings.CAPITAL_API_PASSWORD
-        self.base_url = base_url or settings.CAPITAL_API_BASE_URL
-        self.streaming_url = streaming_url or settings.CAPITAL_API_STREAMING_URL
+        self.api_key = api_key or CAPITAL_SETTINGS.CAPITAL_API_KEY
+        self.api_identifier = api_identifier or CAPITAL_SETTINGS.CAPITAL_API_IDENTIFIER
+        self.api_password = api_password or CAPITAL_SETTINGS.CAPITAL_API_PASSWORD
+        self.base_url = base_url or CAPITAL_SETTINGS.CAPITAL_API_BASE_URL
+        self.streaming_url = streaming_url or CAPITAL_SETTINGS.CAPITAL_API_STREAMING_URL
         self.is_encrypted_password = is_encrypted_password
         
         self.cst = None
@@ -238,7 +238,7 @@ class CapitalComAPI:
             "cst": self.cst,
             "securityToken": self.security_token,
             "payload": {
-                "epics": settings.INSTRUMENTS,
+                "epics": CAPITAL_SETTINGS.INSTRUMENTS,
             }
         }
         

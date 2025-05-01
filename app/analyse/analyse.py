@@ -57,14 +57,14 @@ class StockIndicatorCalculator:
         self.test_mode = test_mode
         self.capital_client = CapitalAPI(db_conn=db_connection)
         # Instrument handling needs update for Capital.com EPICs
-        self.epics = get_capital_epics(WS_FEED_TYPE) # Assuming get_capital_epics exists and returns list of EPICs
+        self.epics = get_capital_epics() # Assuming get_capital_epics exists and returns list of EPICs
         # self.stock_name_map = get_stock_instrument_name_map(self.stocks) # Needs Capital.com equivalent if used
-        self.stock_name_map = {epic: epic for epic in self.epics} # Simple map for now
+        # self.stock_name_map = {epic: epic for epic in self.epics} # Simple map for now
         self.filename = self.get_notes_filename()
         # self.indices_stocks_map, self.stock_index_map = get_indices_stocks_map() # Needs Capital.com equivalent
         # Placeholder for index mapping if needed
-        self.indices_epics_map = {} # e.g., {"IX.D.NIFTY.DAILY.IP": ["EPIC1", "EPIC2"]}
-        self.epic_index_map = {} # e.g., {"EPIC1": "IX.D.NIFTY.DAILY.IP"}
+        # self.indices_epics_map = {} # e.g., {"IX.D.NIFTY.DAILY.IP": ["EPIC1", "EPIC2"]}
+        # self.epic_index_map = {} # e.g., {"EPIC1": "IX.D.NIFTY.DAILY.IP"}
         # Update NIFTY_50_SYMBOL if needed for Capital.com
         # NIFTY_50_SYMBOL = "IX.D.NIFTY.DAILY.IP" # Example EPIC for Nifty 50
 
@@ -92,7 +92,7 @@ class StockIndicatorCalculator:
     
     async def initialize_historical_data(self):
         start_time = datetime.now()
-        await self.fetch_historical_data()
+        # await self.fetch_historical_data()
         # await self.fetch_historical_data_day(self.end_date)
         await self.db_con.delete_existing_index_data()
         end_time = datetime.now()
@@ -168,7 +168,7 @@ class StockIndicatorCalculator:
                 "2024-11-20",
             ]
         
-            cy_holidays_data = await self.capital_client.get_market_holidays() # Capital.com might not support this
+            cy_holidays_data = self.capital_client.get_market_holidays() # Capital.com might not support this
             # Assuming cy_holidays_data is a list of date strings if supported, else empty
             cy_holidays = cy_holidays_data if isinstance(cy_holidays_data, list) else [] 
             # cy_holidays = [data.get("date") for data in cy_holidays_data.get("data", [])] # Original Upstox structure
@@ -409,7 +409,7 @@ class StockIndicatorCalculator:
         await self.db_con.insert_pivot_data_to_db(stock_data['stock'].iloc[0], {"support_levels": support_levels, "resistance_levels": resistance_levels})
         return support_levels, resistance_levels
 
-    async def last_close_price_broke_resistance(self, stock_data: pd.DataFrame, transaction_type: TransactionType):
+    async def last_close_price_broke_resistance(self, stock_data: pd.DataFrame, transaction_type: CapitalTransactionType):
         support_levels, resistance_levels = await self.calculate_pivot_data(stock_data)
         last_close = stock_data['close'].iloc[-1]
         previous_close = stock_data['close'].iloc[-2]
@@ -417,7 +417,7 @@ class StockIndicatorCalculator:
         pivot_broken = False
         broken_level = None
 
-        if transaction_type == TransactionType.BUY:
+        if transaction_type == CapitalTransactionType.BUY:
             for res in resistance_levels:
                 if last_close > res and (previous_close < res or two_days_ago_close < res):
                     pivot_broken = True
@@ -575,7 +575,11 @@ class StockIndicatorCalculator:
         return False
 
     async def _fetch_open_trades(self, stock: str, timestamp: datetime) -> list[Trade]:
-        """Fetch open trades and convert to Trade ob        rows = await self.db_con.fetch_open_orders(stock, timestamp) # Assuming this query returns deal_id and deal_reference
+        """
+        Fetch open trades and convert to Trade objects
+        """
+
+        rows = await self.db_con.fetch_open_orders(stock, timestamp) # Assuming this query returns deal_id and deal_reference
         return [Trade(
             id=row[	'id	'],
             stock=stock, # EPIC
@@ -599,7 +603,9 @@ class StockIndicatorCalculator:
         trade: Trade, 
         current_ltp: float
     ) -> bool:
-        """Adjust SL and PL using 0.8% increments with trailing stop loss."""
+        """
+        Adjust SL and PL using 0.8% increments with trailing stop loss.
+        """
         # Get adjustment count from metadata
         adjustment_count = trade.metadata_json.get('adjustment_count', 0)
         # max_adjustments = 2
@@ -612,16 +618,16 @@ class StockIndicatorCalculator:
         required_movement = (adjustment_count + 1) * (self.TRADE_PERC - 0.002) * entry_price
 
         in_profit = (
-            (trade.trade_type == TransactionType.BUY and current_ltp > entry_price) or
-            (trade.trade_type == TransactionType.SELL and current_ltp < entry_price)
+            (trade.trade_type == CapitalTransactionType.BUY and current_ltp > entry_price) or
+            (trade.trade_type == CapitalTransactionType.SELL and current_ltp < entry_price)
         )
 
         if in_profit and price_movement >= required_movement:
             # Calculate new values based on adjustment count
             # adjustment_factor = (adjustment_count + 1) * self.TRADE_PERC
-            # base_sl = entry_price * (1 + (self.TRADE_PERC if trade.trade_type == TransactionType.SELL else -self.TRADE_PERC))
+            # base_sl = entry_price * (1 + (self.TRADE_PERC if trade.trade_type == CapitalTransactionType.SELL else -self.TRADE_PERC))
             
-            if trade.trade_type == TransactionType.BUY:
+            if trade.trade_type == CapitalTransactionType.BUY:
                 new_sl = entry_price + (adjustment_count * self.TRADE_PERC * entry_price)
                 new_pl = entry_price + (adjustment_count + 1) * self.TRADE_PERC * entry_price
             else:
@@ -661,7 +667,7 @@ class StockIndicatorCalculator:
 
     async def _check_exit_conditions(self, trade: Trade, current_ltp: float) -> tuple[Optional[TradeStatus], Optional[float]]:
         """Check if current price hits SL or PL."""
-        if trade.trade_type == TransactionType.BUY:
+        if trade.trade_type == CapitalTransactionType.BUY:
             trade_status = TradeStatus.PROFIT if current_ltp >= trade.entry_price else TradeStatus.LOSS
             if current_ltp <= trade.sl:
                 return trade_status, current_ltp
@@ -860,9 +866,9 @@ class StockIndicatorCalculator:
             return False
 
         # Check if index confirms the stock's breakout direction
-        if breakout_direction == TransactionType.BUY and current_index_price > index_high:
+        if breakout_direction == CapitalTransactionType.BUY and current_index_price > index_high:
             return True
-        elif breakout_direction == TransactionType.SELL and current_index_price < index_low:
+        elif breakout_direction == CapitalTransactionType.SELL and current_index_price < index_low:
             return True
         
         return False
@@ -913,9 +919,9 @@ class StockIndicatorCalculator:
         # bearish_candles = (current_day_data['close'] < current_day_data['open']).sum()
 
         # Validate breakout direction
-        if breakout_direction == TransactionType.BUY:
+        if breakout_direction == CapitalTransactionType.BUY:
             return (current_close >= previous_day_close)
-        elif breakout_direction == TransactionType.SELL:
+        elif breakout_direction == CapitalTransactionType.SELL:
             return (current_close <= previous_day_close)
         return False
 
@@ -941,14 +947,14 @@ class StockIndicatorCalculator:
     async def calculate_sl_for_breakout(self, direction, entry_price):
         """Calculate SL as 0.8% of entry price"""
         sl_percent = self.TRADE_PERC
-        if direction == TransactionType.BUY:
+        if direction == CapitalTransactionType.BUY:
             return entry_price * (1 - sl_percent)
         return self.apply_tick_size(entry_price * (1 + sl_percent))
 
     async def calculate_pl_for_breakout(self, direction, entry_price):
         """Calculate PL as 0.8% of entry price"""
         pl_percent = self.TRADE_PERC
-        if direction == TransactionType.BUY:
+        if direction == CapitalTransactionType.BUY:
             return entry_price * (1 + pl_percent)
         return self.apply_tick_size(entry_price * (1 - pl_percent))
 

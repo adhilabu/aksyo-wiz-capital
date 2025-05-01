@@ -5,7 +5,7 @@ from typing import List, Dict, Optional
 from app.capital.capital_com import CapitalComAPI
 from app.redis.redis import RedisCache # Assuming RedisCache is still used
 from datetime import datetime, timedelta
-
+from app.shared.config.settings import CAPITAL_SETTINGS
 # Define constants for Capital.com (if needed, e.g., specific market types)
 # Example: INDEX_MARKET = "indices"
 # Example: EQUITY_MARKET = "shares_in"
@@ -127,6 +127,21 @@ async def get_epics_for_strategy(strategy_type: str) -> List[str]:
 
     print(f"Selected {len(epics)} EPICs for strategy type '{strategy_type}'.")
     return epics
+
+def get_capital_epics() -> List[str]:
+    """Get all EPICs from Capital.com instruments."""
+    # This function can be used to get all available EPICs from the loaded instruments.
+    # It can be used for testing or as a fallback if specific strategy types are not defined.
+    if CAPITAL_SETTINGS.UI_INSTRUMENTS:
+        epics = CAPITAL_SETTINGS.UI_INSTRUMENTS.split(",")
+        print(f"Using UI_INSTRUMENTS from settings: {epics}")
+        return epics
+
+    instruments = load_instruments()
+    epics = [inst['epic'] for inst in instruments]
+    print(f"Total EPICs available: {len(epics)}")
+    return epics
+
 
 # TODO: Add functions to map between different instrument identifiers if needed.
 # TODO: Replicate any specific instrument list generation logic from the old instruments.py (e.g., Nifty 100, F&O lists) using Capital.com data.

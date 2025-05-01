@@ -1,4 +1,5 @@
 # Enhanced Capital.com API actions
+import asyncio
 import json
 import os
 from typing import Any, List, Optional, Dict
@@ -142,7 +143,7 @@ class CapitalAPI:
         logger.info(f"Fetching current trading day data for {epic} ({today_str}) with interval {interval}")
         return await self.get_historical_data(epic, today_str, today_str, interval)
 
-    async def get_market_holidays(self):
+    def get_market_holidays(self):
         """Fetch market holidays. Capital.com might not have a direct equivalent. Find alternative source or omit."""
         # Capital.com API docs don't explicitly list a holiday endpoint.
         # May need to fetch from another source (e.g., NSE website) or handle trading times directly.
