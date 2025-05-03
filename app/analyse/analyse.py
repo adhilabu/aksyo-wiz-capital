@@ -991,13 +991,13 @@ class StockIndicatorCalculator:
         breakout_direction = CapitalTransactionType.BUY
         broken_level = sma13  # Using 200 SMA as confirmation level
 
-        # if latest_close > sma13 and latest_close > sma200 and prev_close < sma13:
-        #     breakout_direction = CapitalTransactionType.BUY
-        # elif latest_close < sma13 and latest_close < sma200 and prev_close > sma13:
-        #     breakout_direction = CapitalTransactionType.SELL
-        # else:
-        #     self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
-        #     return
+        if latest_close > sma13 and latest_close > sma200 and prev_close < sma13:
+            breakout_direction = CapitalTransactionType.BUY
+        elif latest_close < sma13 and latest_close < sma200 and prev_close > sma13:
+            breakout_direction = CapitalTransactionType.SELL
+        else:
+            self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
+            return
 
         # pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data, breakout_direction)
         # if not pivot_broken:
@@ -1038,7 +1038,7 @@ class StockIndicatorCalculator:
             return  # Exit if key already exists
 
         # Set TTL for the stock timestamp key (100 seconds)
-        self.redis_cache.client.expire(stock_ts_key, 100)
+        self.redis_cache.client.expire(stock_ts_key, 30)
         
         # Calculate momentum indicators
         rsi, adx, mfi = await asyncio.gather(
