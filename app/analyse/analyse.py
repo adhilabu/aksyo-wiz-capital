@@ -1,6 +1,6 @@
 import asyncio
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 import json
 import os
 from typing import Any, Optional
@@ -30,14 +30,14 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 HISTORY_DATA_PERIOD = int(os.getenv("HISTORY_DATA_PERIOD", 100))
 TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION", "False")
-STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 200)
+STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 2000)
 TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 
 class StockIndicatorCalculator:
     TICK_SIZE = 0.01
-    TRADE_PERC = 0.007
+    TRADE_PERC = 0.003
     MAX_ADJUSTMENTS = 3
     TOTAL_TRADES_LIMIT = 10
     OPEN_TRADES_LIMIT = 5
@@ -109,13 +109,9 @@ class StockIndicatorCalculator:
         await self.analyze_sma_strategy(stock)
         return
 
-    def apply_tick_size(self, price: float) -> float:
-        """Round the price down to the nearest tick size."""
-        return int(price / self.TICK_SIZE) * self.TICK_SIZE
-
     async def get_stock_ltp(self, stock, current_price):
         stock_ltp = await self.db_con.fetch_stock_ltp_from_db(stock) or current_price
-        return self.apply_tick_size(stock_ltp)
+        return stock_ltp
 
     async def transform_1_min_data_to_5_min_data(self, stock: str, in_data: pd.DataFrame):
         data = in_data.copy()
@@ -303,6 +299,44 @@ class StockIndicatorCalculator:
         if executed_trades_updates:
             await self.db_con.update_trade_statuses(executed_trades_updates)
 
+    async def update_open_trades_status(self, stock: str, current_timestamp):
+        """Check and update exit conditions for open/closed trades."""
+        open_trades: list[Trade] = await self._fetch_open_trades(stock, current_timestamp)
+        if not open_trades:
+            return
+
+        executed_trades_updates = []
+        for trade in open_trades:
+            metadata_json = trade.metadata_json.copy()
+            deal_id = metadata_json.get("deal_id")
+            working_order_id = metadata_json.get("working_order_id")
+
+            # Step 1: Resolve deal_id if missing using working_order_id
+            if not deal_id and working_order_id:
+                working_pos_data = await self.capital_client.get_position_status_working_id(working_order_id)
+                if working_pos_data and working_pos_data.get("deal_id"):
+                    deal_id = working_pos_data["deal_id"]
+                    metadata_json["deal_id"] = deal_id
+                    await self.db_con.update_metadata_json(trade.id, metadata_json)
+
+            # Step 2: Check position status using deal_id (includes closed positions)
+            if deal_id:
+                position_data = await self.capital_client.get_position_status_deal_id(deal_id)
+                if not position_data:
+                    continue
+
+                # Update database if position is closed
+                if position_data["position_status"] == "CLOSED":
+                    metadata_json.update({
+                        "profit_loss_status": position_data["profit_loss_status"],
+                        "profit_loss_amount": position_data["profit_loss_amount"]
+                    })
+                    executed_trades_updates.append((position_data["position_status"], trade.id))
+                    await self.db_con.update_metadata_json(trade.id, metadata_json)
+
+        if executed_trades_updates:
+            await self.db_con.update_trade_status_by_id(executed_trades_updates)
+
     async def _handle_eod_square_off(self, timestamp: datetime, stock: str, close_price: float) -> bool:
         """Handle end-of-day position squaring."""
         if timestamp >= timestamp.replace(hour=15, minute=0):
@@ -330,21 +364,20 @@ class StockIndicatorCalculator:
 
         rows = await self.db_con.fetch_open_orders(stock, timestamp) # Assuming this query returns deal_id and deal_reference
         return [Trade(
-            id=row[	'id'],
+            id=row['id'],
             stock=stock, # EPIC
-            entry_ltp=row[	'ltp'],
-            entry_cp=row[	'cp'],
-            entry_price=row[	'entry_price'],
-            sl=row[	'sl'],
-            pl=row[	'pl'],
-            entry_time=row[	'timestamp'],
-            trade_type=row[	'trade_type'], # Ensure this maps to CapitalTransactionType
-            tag=f"{stock}_tag", # Tag concept needs review for Capital.com
-            metadata_json=json.loads(row[	'metadata_json']) if row[	'metadata_json'] else {},
-            order_ids=[], # Deprecated, use deal_id/deal_reference
-            deal_id=row.get(	'deal_id	'), # Fetch from DB
-            deal_reference=row.get(	'deal_reference	'), # Fetch from DB
-            order_status=row[	'order_status'],
+            entry_ltp=row['ltp'],
+            entry_cp=row['cp'],
+            entry_price=row['entry_price'],
+            sl=row['sl'],
+            pl=row['pl'],
+            entry_time=row['timestamp'],
+            trade_type=row['trade_type'],
+            tag=f"{stock}_tag",
+            metadata_json=json.loads(row['metadata_json']) if row['metadata_json'] else {},
+            order_ids=json.loads(row.get('order_ids')),
+            order_status=row['order_status'],
+            deal_id=json.loads(row.get('order_ids'))[0] if row.get('order_ids') else ''
         ) for row in rows] if rows else []
 
     async def _adjust_sl_pl(
@@ -632,9 +665,9 @@ class StockIndicatorCalculator:
             just_created = True
         return just_created, reversal_data
 
-    async def ensure_market_details(self, epic: str) -> Optional[CapitalMarketDetails]:
+    async def ensure_market_details(self, epic: str, timestamp) -> Optional[CapitalMarketDetails]:
         """Ensure market details are available, fetching from API if necessary"""
-        market_data = await self.db_con.get_capital_market_details(epic)
+        market_data = await self.db_con.get_capital_market_details(epic, timestamp)
         if market_data:
             return market_data
 
@@ -698,48 +731,71 @@ class StockIndicatorCalculator:
             desired_pl = entry_price + max_distance if direction == CapitalTransactionType.BUY else entry_price - max_distance
         
         return round(desired_pl / step) * step if step != 0 else desired_pl
+    
+    async def calculate_rounded_value_with_step(self, value: float, details: CapitalMarketDetails) -> float:        
+        # Calculate step size
+        min_step = details.min_step_distance
+        if details.min_step_distance_unit == 'PERCENTAGE':
+            step = value * (min_step / 100)
+        else:
+            step = min_step
+            
+        return round(value / step) * step if step != 0 else value
 
     async def get_base_payload_for_capital_order(self, epic: str, stock_ltp: float, 
                                             trans_type: CapitalTransactionType = CapitalTransactionType.BUY, 
-                                            order_type: CapitalOrderType = CapitalOrderType.MARKET) -> Optional[BasicPlaceOrderCapital]:
+                                            order_type: CapitalOrderType = CapitalOrderType.MARKET, timestamp = None) -> Optional[BasicPlaceOrderCapital]:
         if stock_ltp <= 0:
             self.logger.warning(f"Invalid LTP {stock_ltp} for {epic}")
             return None
         
         # Fetch instrument details to ensure rules are loaded
-        market_details = await self.ensure_market_details(epic)
+        market_details = await self.ensure_market_details(epic, timestamp)
         
         # Calculate dynamic SL/PL
         stop_loss = await self.calculate_sl_for_breakout(trans_type, stock_ltp, epic, market_details)
         profit_level = await self.calculate_pl_for_breakout(trans_type, stock_ltp, epic, market_details)
         
         # Quantity calculation
-        quantity = int(self.stock_per_price_limit // stock_ltp)
+        quantity = float(self.stock_per_price_limit / stock_ltp)
         
+
+        def round_to_increment(quantity, increment):
+            quantity = Decimal(str(quantity))
+            increment = Decimal(str(increment))
+            rounded = (quantity / increment).quantize(Decimal('1'), rounding=ROUND_UP) * increment
+            return float(rounded)
+
         # Validate quantity against market rules
         if market_details:
             if quantity < market_details.min_deal_size:
                 self.logger.warning(f"Calculated quantity {quantity} is below minimum deal size {market_details.min_deal_size} for {epic}.")
-                quantity = int(market_details.min_deal_size)
+                quantity = float(market_details.min_deal_size)
             elif quantity > market_details.max_deal_size:
                 self.logger.warning(f"Calculated quantity {quantity} exceeds maximum deal size {market_details.max_deal_size} for {epic}.")
-                quantity = int(market_details.max_deal_size)
+                quantity = float(market_details.max_deal_size)
             
             # Round to the nearest valid increment
-            quantity = int(quantity // market_details.min_size_increment * market_details.min_size_increment)
+            quantity = round_to_increment(quantity, market_details.min_deal_size)
         
         if quantity <= 0:
             self.logger.warning(f"Calculated quantity is zero or negative for {epic} at LTP {stock_ltp}. Skipping order.")
             return None
+        
+        order_price = await self.calculate_rounded_value_with_step(stock_ltp, market_details)
+        stop_distance = await self.calculate_rounded_value_with_step(abs(stock_ltp - stop_loss), market_details)
+        profit_distance = await self.calculate_rounded_value_with_step(abs(stock_ltp - profit_level), market_details)
 
         return BasicPlaceOrderCapital(
             quantity=quantity,
-            price=stock_ltp if order_type in [CapitalOrderType.LIMIT, CapitalOrderType.STOP] else None,
+            price=order_price if order_type in [CapitalOrderType.LIMIT, CapitalOrderType.STOP] else None,
             epic=epic,
             order_type=order_type,
             transaction_type=trans_type,
             stop_loss=stop_loss,
-            profit_level=profit_level
+            profit_level=profit_level,
+            stop_distance=stop_distance,
+            profit_distance=profit_distance,
         )
 
     async def calculate_atr(self, stock_data_5_min, period=14):
@@ -902,9 +958,9 @@ class StockIndicatorCalculator:
             return
 
         final_stock_data = stock_data.iloc[-1]
-        
+        current_timestamp = stock_data.iloc[-1]['timestamp']
         # Existing checks remain unchanged
-        await self.check_and_execute_exit_trade_type_2(final_stock_data)
+        await self.update_open_trades_status(stock, current_timestamp)
         if stock in self.executed_breakouts and self.executed_breakouts[stock]:
             self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
             return
@@ -935,13 +991,13 @@ class StockIndicatorCalculator:
         breakout_direction = CapitalTransactionType.BUY
         broken_level = sma13  # Using 200 SMA as confirmation level
 
-        if latest_close > sma13 and latest_close > sma200 and prev_close < sma13:
-            breakout_direction = CapitalTransactionType.BUY
-        elif latest_close < sma13 and latest_close < sma200 and prev_close > sma13:
-            breakout_direction = CapitalTransactionType.SELL
-        else:
-            self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
-            return
+        # if latest_close > sma13 and latest_close > sma200 and prev_close < sma13:
+        #     breakout_direction = CapitalTransactionType.BUY
+        # elif latest_close < sma13 and latest_close < sma200 and prev_close > sma13:
+        #     breakout_direction = CapitalTransactionType.SELL
+        # else:
+        #     self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
+        #     return
 
         # pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data, breakout_direction)
         # if not pivot_broken:
@@ -951,11 +1007,13 @@ class StockIndicatorCalculator:
         # Determine SL and PL based on breakout direction
         stock_ltp = await self.get_stock_ltp(stock, current_price)
         # Prepare order payload
+        order_type = CapitalOrderType.MARKET
         base_payload = await self.get_base_payload_for_capital_order(
             epic=stock,
             stock_ltp=stock_ltp,
             trans_type=breakout_direction,
-            order_type=CapitalOrderType.LIMIT
+            order_type=order_type,
+            timestamp=current_timestamp
         )
         
         if not base_payload:
@@ -971,6 +1029,16 @@ class StockIndicatorCalculator:
         if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
             self.logger.info("SMA: Max loss trades reached. Skipping.")
             return
+                
+        # Redis key for stock timestamp validation
+        stock_ts_key = f"order:{stock}:{current_timestamp}"
+
+        # Check if this stock timestamp combination already exists
+        if not self.redis_cache.client.setnx(stock_ts_key, 1):
+            return  # Exit if key already exists
+
+        # Set TTL for the stock timestamp key (100 seconds)
+        self.redis_cache.client.expire(stock_ts_key, 100)
         
         # Calculate momentum indicators
         rsi, adx, mfi = await asyncio.gather(
@@ -980,7 +1048,14 @@ class StockIndicatorCalculator:
         )
         
         indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
-        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, sl, pl, breakout_direction)
+        await self.send_telegram_notification(
+            final_stock_data,
+            indicator_values,
+            broken_level,
+            base_payload.stop_loss,
+            base_payload.profit_level,
+            breakout_direction
+        )
 
         # Prepare metadata including ATR and SMAs
         metadata_json = {
@@ -989,19 +1064,19 @@ class StockIndicatorCalculator:
         }
 
         # Place order and log trade
-        await self.capital_client.place_order(base_payload)
+        deal_reference = await self.capital_client.place_order(base_payload)
         await self.db_con.log_trade_to_db(
             final_stock_data,
             indicator_values,
             broken_level,
-            base_payload.stop_loss,
-            base_payload.profit_level,
+            base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance,
+            base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance,
             breakout_direction,
             stock,
             metadata_json,
             base_payload.quantity,
             order_status=True if self.test_mode else False,
-            order_ids=[],
+            order_ids=[deal_reference],
             stock_ltp=stock_ltp
         )
 

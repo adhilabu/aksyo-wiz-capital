@@ -30,14 +30,12 @@ class CapitalAPI:
             await self.db_conn.execute(
                 """
                 INSERT INTO capital_log (endpoint, request_payload, response_payload, status_code)
-                VALUES (%s, %s::json, %s::json, %s)
+                VALUES ($1, $2::json, $3::json, $4)
                 """,
-                (
-                    endpoint,
-                    json.dumps(request_payload),
-                    json.dumps(response_payload),
-                    status_code,
-                ),
+                endpoint,
+                json.dumps(request_payload),
+                json.dumps(response_payload),
+                status_code,
             )
             logger.debug(f"Logged API interaction for endpoint: {endpoint}")
         except Exception as e:
@@ -146,10 +144,10 @@ class CapitalAPI:
             "guaranteedStop": False, # Default, can be made configurable
             "forceOpen": True # Ensures it opens a new position
         }
-        if basic_order.stop_loss:
-            payload["stopLevel"] = basic_order.stop_loss
-        if basic_order.profit_level:
-            payload["profitLevel"] = basic_order.profit_level
+        if basic_order.stop_distance:
+            payload["stopDistance"] = basic_order.stop_distance
+        if basic_order.profit_distance:
+            payload["profitDistance"] = basic_order.profit_distance
         # Add trailingStop, stopDistance if needed
         return payload
 
@@ -160,15 +158,14 @@ class CapitalAPI:
             "direction": basic_order.transaction_type.value,
             "size": basic_order.quantity,
             "level": basic_order.price, # The price for LIMIT/STOP
-            "type": basic_order.order_type.value, # LIMIT or STOP
-            "goodTillDate": None, # Or set an expiry, e.g., (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%S')
+            "type": basic_order.order_type.value,
+            "goodTillDate": None,
             "guaranteedStop": True,
         }
         if basic_order.stop_loss:
             payload["stopLevel"] = basic_order.stop_loss
         if basic_order.profit_level:
             payload["profitLevel"] = basic_order.profit_level
-        # Add stopDistance if needed for STOP orders
         return payload
 
     async def place_order(self, basic_order: BasicPlaceOrderCapital) -> Optional[str]:
@@ -336,25 +333,6 @@ class CapitalAPI:
             # await self.log_request_response(endpoint, payload, {"error": str(e)}, 500)
             return None
 
-    async def get_confirmation(self, deal_reference: str) -> Optional[dict]:
-        """Get the confirmation status of a deal using its reference."""
-        endpoint = f"/api/v1/confirms/{deal_reference}"
-        try:
-            response = await self.client.get(endpoint)
-            status_code = 200
-            # await self.log_request_response(endpoint, {}, response, status_code)
-            logger.debug(f"Fetched confirmation for reference: {deal_reference}")
-            # Check response status, e.g., response.get('dealStatus') == 'ACCEPTED'
-            return response
-        except Exception as e:
-            # Handle 404 if confirmation not found yet
-            if hasattr(e, 	'response	') and e.response.status_code == 404:
-                logger.debug(f"Confirmation for {deal_reference} not found yet.")
-                return None
-            logger.error(f"Error getting confirmation for {deal_reference}: {e}")
-            # await self.log_request_response(endpoint, {}, {"error": str(e)}, 500)
-            return None
-
     async def get_position_details(self, deal_id: str) -> Optional[dict]:
         """Get details of a specific open position by its deal ID."""
         try:
@@ -492,7 +470,7 @@ class CapitalAPI:
             max_stop_or_profit_distance=dealing_rules.get('maxStopOrProfitDistance', {}).get('value'),
             max_stop_or_profit_distance_unit=dealing_rules.get('maxStopOrProfitDistance', {}).get('unit'),
             decimal_places=snapshot.get('decimalPlaces'),
-            margin_factor=snapshot.get('marginFactor')
+            margin_factor=snapshot.get('scalingFactor')
         )
 
         # Save to database
@@ -500,50 +478,113 @@ class CapitalAPI:
             """
             INSERT INTO capital_market_details 
             (epic, min_step_distance, min_step_distance_unit, min_deal_size, 
-             min_deal_size_unit, max_deal_size, max_deal_size_unit, min_size_increment,
-             min_size_increment_unit, min_guaranteed_stop_distance, 
-             min_guaranteed_stop_distance_unit, min_stop_or_profit_distance,
-             min_stop_or_profit_distance_unit, max_stop_or_profit_distance,
-             max_stop_or_profit_distance_unit, decimal_places, margin_factor)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(epic) DO UPDATE SET
-                min_step_distance=excluded.min_step_distance,
-                min_step_distance_unit=excluded.min_step_distance_unit,
-                min_deal_size=excluded.min_deal_size,
-                min_deal_size_unit=excluded.min_deal_size_unit,
-                max_deal_size=excluded.max_deal_size,
-                max_deal_size_unit=excluded.max_deal_size_unit,
-                min_size_increment=excluded.min_size_increment,
-                min_size_increment_unit=excluded.min_size_increment_unit,
-                min_guaranteed_stop_distance=excluded.min_guaranteed_stop_distance,
-                min_guaranteed_stop_distance_unit=excluded.min_guaranteed_stop_distance_unit,
-                min_stop_or_profit_distance=excluded.min_stop_or_profit_distance,
-                min_stop_or_profit_distance_unit=excluded.min_stop_or_profit_distance_unit,
-                max_stop_or_profit_distance=excluded.max_stop_or_profit_distance,
-                max_stop_or_profit_distance_unit=excluded.max_stop_or_profit_distance_unit,
-                decimal_places=excluded.decimal_places,
-                margin_factor=excluded.margin_factor,
-                updated_at=CURRENT_TIMESTAMP
+            min_deal_size_unit, max_deal_size, max_deal_size_unit, min_size_increment,
+            min_size_increment_unit, min_guaranteed_stop_distance, 
+            min_guaranteed_stop_distance_unit, min_stop_or_profit_distance,
+            min_stop_or_profit_distance_unit, max_stop_or_profit_distance,
+            max_stop_or_profit_distance_unit, decimal_places, margin_factor)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             """,
-            (
-                capital_market_details.epic,
-                capital_market_details.min_step_distance,
-                capital_market_details.min_step_distance_unit,
-                capital_market_details.min_deal_size,
-                capital_market_details.min_deal_size_unit,
-                capital_market_details.max_deal_size,
-                capital_market_details.max_deal_size_unit,
-                capital_market_details.min_size_increment,
-                capital_market_details.min_size_increment_unit,
-                capital_market_details.min_guaranteed_stop_distance,
-                capital_market_details.min_guaranteed_stop_distance_unit,
-                capital_market_details.min_stop_or_profit_distance,
-                capital_market_details.min_stop_or_profit_distance_unit,
-                capital_market_details.max_stop_or_profit_distance,
-                capital_market_details.max_stop_or_profit_distance_unit,
-                capital_market_details.decimal_places,
-                capital_market_details.margin_factor
-            )
+            capital_market_details.epic,
+            capital_market_details.min_step_distance,
+            capital_market_details.min_step_distance_unit,
+            capital_market_details.min_deal_size,
+            capital_market_details.min_deal_size_unit,
+            capital_market_details.max_deal_size,
+            capital_market_details.max_deal_size_unit,
+            capital_market_details.min_size_increment,
+            capital_market_details.min_size_increment_unit,
+            capital_market_details.min_guaranteed_stop_distance,
+            capital_market_details.min_guaranteed_stop_distance_unit,
+            capital_market_details.min_stop_or_profit_distance,
+            capital_market_details.min_stop_or_profit_distance_unit,
+            capital_market_details.max_stop_or_profit_distance,
+            capital_market_details.max_stop_or_profit_distance_unit,
+            capital_market_details.decimal_places,
+            capital_market_details.margin_factor
         )
 
         return capital_market_details
+    
+    async def get_deal_reference_status(self, deal_reference):
+        deal_ref_data = await self.client.get_confirmation(deal_reference)
+        deal_status = deal_ref_data.get("status")
+        working_order_id = deal_ref_data.get("dealId")
+        # If order isn't filled, return status
+        if working_order_id:
+            return {"order_status": True, "status": deal_status, "working_order_id": working_order_id}
+        return {"order_status": False, "status": deal_status}
+    
+    async def get_position_status_working_id(self, working_id):
+        """Fetch position status and profit/loss details."""
+        positions = await self.client.get_positions()
+        if not positions:
+            print("No positions found.")
+            return None
+
+        positions_list = positions.get("positions", [])
+        if not positions_list:
+            print("No positions found.")
+            return None
+        
+        position_data = next((p for p in positions_list if p.get("position", {}).get("workingOrderId") == working_id), None)
+        if not position_data:
+            print(f"Position not found for ID: {working_id}")
+            return None
+        
+        position_status = position_data.get("market", {}).get('marketStatus')
+        deal_id = position_data.get("position", {}).get("dealId")
+        # If position is closed, return status
+        profit_loss = position_data.get('position', {}).get("upl", 0)        
+        pl_status = "PROFIT" if profit_loss > 0 else "LOSS" if profit_loss < 0 else "BREAKEVEN"
+        if position_status not in ["TRADEABLE", "CLOSED"]:
+            print(f"Position doesn't exist or is closed for ID: {working_id}")
+            return {
+                "position_status": position_status,
+                "profit_loss_status": pl_status,
+                "profit_loss_amount": profit_loss,
+                "deal_id": deal_id
+            }
+        
+        # Step 4: Determine profit/loss (adjust field name as per API)
+
+        if position_status == 'CLOSED':
+            return {
+                "position_status": position_status,
+                "profit_loss_status": pl_status,
+                "profit_loss_amount": profit_loss,
+                "deal_id": deal_id
+            }
+        
+        return {
+            "position_status": "OPEN",
+            "profit_loss_status": pl_status,
+            "profit_loss_amount": profit_loss,
+            "deal_id": deal_id
+        }
+        
+    async def get_position_status_deal_id(self, deal_id: str) -> dict:
+        """Get position status (including closed) by deal_id."""
+        positions_resp = await self.client.get_positions(status="ALL")
+        positions = positions_resp.get("positions", [])
+
+        # Find position by deal_id in open/closed positions
+        position = next(
+            (p for p in positions if p.get("position", {}).get("dealId") == deal_id),
+            None
+        )
+
+        if not position:
+            return {"position_status": "CLOSED", "profit_loss_status": "UNKNOWN", "profit_loss_amount": 0}
+
+        # Extract status and P/L
+        market_status = position.get("market", {}).get("marketStatus", "UNKNOWN")
+        position_status = "CLOSED" if market_status == "CLOSED" else "OPEN"
+        profit_loss = position.get("position", {}).get("upl", 0)
+        pl_status = "PROFIT" if profit_loss > 0 else "LOSS" if profit_loss < 0 else "BREAKEVEN"
+
+        return {
+            "position_status": position_status,
+            "profit_loss_status": pl_status,
+            "profit_loss_amount": profit_loss
+        }

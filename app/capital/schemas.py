@@ -53,8 +53,8 @@ class BasicPlaceOrderCapital(BaseModel):
     transaction_type: CapitalTransactionType
     stop_loss: Optional[float] = None # Maps to stopLevel
     profit_level: Optional[float] = None # Maps to profitLevel
-    # Add other fields if needed, e.g., guaranteedStop, trailingStop
-    # parent_instrument_key is removed as Capital.com uses epic directly
+    stop_distance: Optional[float] = None # Maps to stopDistance
+    profit_distance: Optional[float] = None # Maps to profitDistance
 
 # --- WebSocket Schemas (Placeholder) ---
 

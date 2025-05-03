@@ -128,7 +128,7 @@ class DBConnection:
         data = await self.fetch(query, stock, self.end_date)
         return [row['timestamp'] for row in data]
 
-    async def log_trade_to_db(self, stock_data, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: CapitalTransactionType = CapitalTransactionType.BUY, stock_name = None, metadata_json: Optional[dict] = None, qty: int = 0, order_status: bool = False, order_ids: list = [], stock_ltp: Optional[str] = None, deal_id: Optional[str] = None, deal_reference: Optional[str] = None): # Added deal_id and deal_reference
+    async def log_trade_to_db(self, stock_data, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: CapitalTransactionType = CapitalTransactionType.BUY, stock_name = None, metadata_json: Optional[dict] = None, qty: int = 0, order_status: bool = False, order_ids: list = [], stock_ltp: Optional[str] = None): # Added deal_id and deal_reference
         if metadata_json is None:
             metadata_json = {}
 
@@ -137,12 +137,12 @@ class DBConnection:
         ltp = stock_ltp or stock_data['ltp']
         timestamp = stock_data['timestamp']
         query = """
-        INSERT INTO order_details (stock, ltp, sl, pl, cp, broke_resistance_level, rsi, adx, mfi, timestamp, entry_price, trade_type, stock_name, metadata_json, qty, order_status, order_ids, deal_id, deal_reference) # Added deal_id, deal_reference
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $2, $11, $12, $13, $14, $15, $16, $17, $18) # Added $17, $18
+        INSERT INTO order_details (stock, ltp, sl, pl, cp, broke_resistance_level, rsi, adx, mfi, timestamp, entry_price, trade_type, stock_name, metadata_json, qty, order_status, order_ids)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $2, $11, $12, $13, $14, $15, $16)
         """
         # Ensure trade_type is the string value ('BUY' or 'SELL') for DB insertion
         trade_type_value = trade_type.value if isinstance(trade_type, Enum) else trade_type
-        values = (stock, ltp, sl, pl, ltp, broken_level, indicator_values.rsi, indicator_values.adx, indicator_values.mfi, timestamp, trade_type_value, stock_name, json.dumps(metadata_json), qty, order_status, json.dumps(order_ids), deal_id, deal_reference)
+        values = (stock, ltp, sl, pl, ltp, broken_level, indicator_values.rsi, indicator_values.adx, indicator_values.mfi, timestamp, trade_type_value, stock_name, json.dumps(metadata_json), qty, order_status, json.dumps(order_ids))
         await self.execute(query, *values)
 
     async def get_historical_data_for_stock(self, stock, timestamp, rows=3):
@@ -216,6 +216,38 @@ class DBConnection:
         SELECT * FROM order_details WHERE stock = $1 AND status = 'OPEN' AND DATE(timestamp) = $2
         """
         return await self.fetch(query, stock, trade_date)
+
+    async def update_trade_status_by_id(self, executed_trades: list):
+        """
+        Update the trade statuses in the database for given trade IDs.
+        executed_trades: list of tuples [(status, trade_id), ...]
+        """
+        if not executed_trades:
+            return
+
+        # Start the update query
+        query = """
+        UPDATE order_details
+        SET 
+            status = CASE 
+        """
+        for status, trade_id in executed_trades:
+            query += f"WHEN id = {trade_id} THEN '{status}' "
+        query += "END\n"
+
+        # Add WHERE clause to limit updates to relevant IDs
+        ids = ', '.join(str(trade_id) for _, trade_id in executed_trades)
+        query += f"WHERE id IN ({ids});"
+
+        try:
+            await self.execute(query)
+        except asyncpg.exceptions.UndefinedColumnError as e:
+            print(f"Failed to update trade statuses due to undefined column: {e}. Query: {query}")
+            raise
+        except asyncpg.exceptions.PostgresSyntaxError as e:
+            print(f"Postgres syntax error: {e}. Query: {query}")
+            raise
+
 
     async def update_trade_statuses(self, executed_trades: list):
         """
@@ -463,6 +495,15 @@ class DBConnection:
         WHERE id = $2
         """
         await self.execute(query, order_status, id)
+    
+    async def update_metadata_json(self, id: int, metadata_json: dict):
+        """UPDATE METADATA JSON FOR THE ORDER DATA"""
+        query = """
+        UPDATE order_details
+        SET metadata_json = $1
+        WHERE id = $2
+        """
+        await self.execute(query, json.dumps(metadata_json), id)
 
     async def check_loss_trades_count(self, count=5):
         query = """
@@ -471,7 +512,7 @@ class DBConnection:
         data = await self.fetch(query, self.end_date)
         return len(data) >= count
 
-    async def get_capital_market_details(self, epic: str) -> Optional[CapitalMarketDetails]:
+    async def get_capital_market_details(self, epic: str, timestamp) -> Optional[CapitalMarketDetails]:
         """Retrieve market details from the database"""
 
         query = """
@@ -480,12 +521,12 @@ class DBConnection:
                      min_stop_or_profit_distance, min_stop_or_profit_distance_unit, max_stop_or_profit_distance, max_stop_or_profit_distance_unit,
                      decimal_places, margin_factor
             FROM capital_market_details
-            WHERE epic = $1
+            WHERE epic = $1 and DATE(created_at) = $2
         """ 
 
-        data = await self.fetch(query, epic)
+        data = await self.fetch(query, epic, timestamp.date())
         if data:
-            CapitalMarketDetails(
+            return CapitalMarketDetails(
                 epic=data[0]['epic'],
                 min_step_distance=data[0]['min_step_distance'],
                 min_step_distance_unit=data[0]['min_step_distance_unit'],

@@ -173,7 +173,8 @@ class CapitalComAPI:
             return response.json()
         else:
             logger.error(f"GET request failed: {response.status_code} - {response.text}")
-            response.raise_for_status()
+            # response.raise_for_status()
+            return {}
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     async def post(self, endpoint: str, data: Dict) -> Dict:
@@ -189,7 +190,8 @@ class CapitalComAPI:
             return response.json()
         else:
             logger.error(f"POST request failed: {response.status_code} - {response.text}")
-            response.raise_for_status()
+            # response.raise_for_status()
+            return {}
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     async def put(self, endpoint: str, data: Dict) -> Dict:
@@ -205,7 +207,8 @@ class CapitalComAPI:
             return response.json()
         else:
             logger.error(f"PUT request failed: {response.status_code} - {response.text}")
-            response.raise_for_status()
+            # response.raise_for_status()
+            return {}
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     async def delete(self, endpoint: str) -> Dict:
@@ -221,7 +224,8 @@ class CapitalComAPI:
             return response.json()
         else:
             logger.error(f"DELETE request failed: {response.status_code} - {response.text}")
-            response.raise_for_status()
+            # response.raise_for_status()
+            return {}
     
     async def connect_websocket(self) -> websockets.WebSocketClientProtocol:
         """
@@ -304,12 +308,11 @@ class CapitalComAPI:
         
         return await self.get("/api/v1/markets", params)
     
-    async def get_positions(self) -> Dict:
-        """
-        Get all open positions.
-        """
-        return await self.get("/api/v1/positions")
-    
+    async def get_positions(self, status: str = None) -> Dict:
+        """Get positions with optional status filter."""
+        params = {"status": status} if status else {}
+        return await self.get("/api/v1/positions", params=params)
+        
     async def create_position(
         self,
         epic: str,
@@ -397,4 +400,24 @@ class CapitalComAPI:
     async def fetch_epic_market_details(self, epic: str) -> Optional[Dict[str, Any]]:
         """Fetch market details from Capital.com API for a specific instrument"""
         url = f"/api/v1/markets/{epic}"
-        await self.get(url)
+        return await self.get(url)
+
+    async def get_confirmation(self, deal_reference: str) -> Optional[dict]:
+        """Get the confirmation status of a deal using its reference."""
+        endpoint = f"/api/v1/confirms/{deal_reference}"
+        return await self.get(endpoint)
+
+    async def get_position(self, position_id: str) -> Optional[Dict[str, Any]]:
+        """Get positions from Capital.com API."""
+        endpoint = f"/api/v1/positions/{position_id}"
+        return await self.get(endpoint)
+        
+    async def get_deals(self, related_deal_id: str, deal_action: str = None):
+        """Fetch deals filtered by relatedDealId and dealAction."""
+        endpoint = "/api/v1/deals"
+        params = {}
+        if related_deal_id:
+            params['relatedDealId'] = related_deal_id
+        if deal_action:
+            params['dealAction'] = deal_action
+        return await self.get(endpoint, params=params)

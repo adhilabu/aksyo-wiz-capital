@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS stock_data (
 );
 
 
-CREATE TABLE support_resistance_levels (
+CREATE TABLE IF NOT EXISTS support_resistance_levels (
     id SERIAL PRIMARY KEY,
     stock TEXT NOT NULL,
     start_date DATE NOT NULL,
@@ -64,7 +64,11 @@ CREATE TABLE support_resistance_levels (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
-ALTER TABLE support_resistance_levels ADD CONSTRAINT unique_stock_date UNIQUE (stock, start_date, end_date);
+-- For support_resistance_levels table
+ALTER TABLE support_resistance_levels 
+    DROP CONSTRAINT IF EXISTS unique_stock_date;
+ALTER TABLE support_resistance_levels 
+    ADD CONSTRAINT unique_stock_date UNIQUE (stock, start_date, end_date);
 
 CREATE TABLE IF NOT EXISTS order_details (
     id SERIAL PRIMARY KEY,
@@ -86,7 +90,7 @@ CREATE TABLE IF NOT EXISTS order_details (
 -- SELECT SUM(CASE WHEN status = 'PROFIT' THEN ((pl - ltp) * (10000 / ltp)) ELSE 0 END) AS total_profit, SUM(CASE WHEN status = '
 --  LOSS' THEN ((ltp - sl) * (10000 / ltp)) ELSE 0 END) AS total_loss FROM order_details WHERE status IN ('PROFIT', 'LOSS');
 
-CREATE TABLE upstox_log (
+CREATE TABLE IF NOT EXISTS capital_log (
     id SERIAL PRIMARY KEY,                         
     endpoint VARCHAR(255) NOT NULL,               
     request_payload JSON NOT NULL,                
@@ -95,7 +99,7 @@ CREATE TABLE upstox_log (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP 
 );
 
-CREATE TABLE index_indicators_data (
+CREATE TABLE IF NOT EXISTS index_indicators_data (
   id SERIAL PRIMARY KEY, 
   index_symbol VARCHAR(255) NULL, 
   index_name VARCHAR(255) NULL, 
@@ -108,18 +112,23 @@ CREATE TABLE index_indicators_data (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-ALTER TABLE index_indicators_data ADD CONSTRAINT unique_index_symbol_name UNIQUE (index_symbol, index_name);
-ALTER TABLE order_details ADD COLUMN entry_price REAL NOT NULL DEFAULT 0;
-ALTER TABLE order_details ADD COLUMN exit_price REAL NOT NULL DEFAULT 0;
-CREATE TABLE historical_data ( id SERIAL, ltp DOUBLE PRECISION, "timestamp" TIMESTAMP WITHOUT TIME ZONE NOT NULL, open DOUBLE PRECISION, high DOUBLE PRECISION, low DOUBLE PRECISION, close DOUBLE PRECISION, volume BIGINT, open_interest BIGINT, stock VARCHAR(255) NOT NULL );
-ALTER TABLE order_details ADD COLUMN stock_name TEXT NULL DEFAULT NULL;
+-- For index_indicators_data table
+ALTER TABLE index_indicators_data 
+    DROP CONSTRAINT IF EXISTS unique_index_symbol_name;
+ALTER TABLE index_indicators_data 
+    ADD CONSTRAINT unique_index_symbol_name UNIQUE (index_symbol, index_name);
+
+ALTER TABLE order_details ADD COLUMN IF NOT EXISTS entry_price REAL NOT NULL DEFAULT 0;
+ALTER TABLE order_details ADD COLUMN IF NOT EXISTS exit_price REAL NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS historical_data ( id SERIAL, ltp DOUBLE PRECISION, "timestamp" TIMESTAMP WITHOUT TIME ZONE NOT NULL, open DOUBLE PRECISION, high DOUBLE PRECISION, low DOUBLE PRECISION, close DOUBLE PRECISION, volume BIGINT, open_interest BIGINT, stock VARCHAR(255) NOT NULL );
+ALTER TABLE order_details ADD COLUMN IF NOT EXISTS stock_name TEXT NULL DEFAULT NULL;
 
 -- SELECT date(timestamp) AS order_date, COUNT(*) AS total_trades, ROUND(SUM( CASE WHEN status = 'PROFIT' THEN (exit_price - entry_price) * (100000 / entry_price) ELSE 0 END )::numeric, 2) AS total_profit, ROUND(SUM( CASE WHEN status = 'LOSS' THEN (entry_price - exit_price) * (100000 / entry_price) ELSE 0 END )::numeric, 2) AS total_loss, ROUND( (SUM(CASE WHEN status = 'PROFIT' THEN 1 ELSE 0 END)::numeric / COUNT(*) * 100), 2 ) AS trade_accuracy_percentage, ROUND( ( (SUM(CASE WHEN status = 'PROFIT' THEN (exit_price - entry_price) * (100000 / entry_price) ELSE 0 END) - SUM(CASE WHEN status = 'LOSS' THEN (entry_price - exit_price) * (100000 / entry_price) ELSE 0 END) )::numeric / 100000.0 * 100 ), 2 ) AS net_profit_percentage, ROUND((COUNT(*) * 60)::numeric, 2) AS total_charges, ROUND( ( ( SUM(CASE WHEN status = 'PROFIT' THEN (exit_price - entry_price) * (100000 / entry_price) ELSE 0 END) - SUM(CASE WHEN status = 'LOSS' THEN (entry_price - exit_price) * (100000 / entry_price) ELSE 0 END) ) - (COUNT(*) * 60) )::numeric / 100000.0 * 100, 2 ) AS final_profit_percentage FROM order_details WHERE status IN ('PROFIT', 'LOSS') GROUP BY date(timestamp) ORDER BY order_date;
 -- SELECT date(timestamp) AS order_date, COUNT(*) AS total_trades, ROUND(SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END )::numeric, 2) AS total_profit, ROUND(SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END )::numeric, 2) AS total_loss, ROUND((SUM(CASE WHEN status = 'PROFIT' THEN 1 ELSE 0 END)::numeric / COUNT(*) * 100), 2) AS trade_accuracy_percentage, ROUND(((SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END) - SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END ))::numeric / 100000.0 * 100), 2) AS net_profit_percentage, ROUND((COUNT(*) * 60)::numeric, 2) AS total_charges, ROUND(((SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END) - SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END ) - (COUNT(*) * 60))::numeric / 100000.0 * 100), 2) AS final_profit_percentage FROM order_details WHERE status IN ('PROFIT', 'LOSS') GROUP BY date(timestamp) ORDER BY order_date;
 -- SELECT date(timestamp) AS order_date, COUNT(*) AS total_trades, ROUND(SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_p rice - entry_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END )::numeri c, 2) AS total_profit, ROUND(SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'LOSS' AND tra de_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END )::numeric, 2) AS total_loss, ROUND((SUM(CASE WHEN status = 'PROFIT' THEN 1 ELSE 0 END)::numeric / COUNT(*) * 100), 2) AS trade_accuracy_percentage, ROUND(( ( SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_price - entry_price) * ( 100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END ) - SUM( CASE WHEN status = 'LOS S' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (10000 0 / exit_price) ELSE 0 END ) )::numeric / 100000.0 * 100 ), 2) AS net_profit_percentage, ROUND((COUNT(*) * 60)::numeric, 2) AS total_charges, ROUND(( ( SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exi t_price) * (100000 / exit_price) ELSE 0 END ) - SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN stat us = 'LOSS' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END ) - (COUNT(*) * 60) )::numeric / 100000.0 * 100 ), 2) AS final_p rofit_percentage FROM order_details WHERE status IN ('PROFIT', 'LOSS') GROUP BY date(timestamp) ORDER BY order_date;
 -- SELECT date(timestamp) AS order_date, COUNT(*) AS total_trades, ROUND(SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END )::numeric, 2) AS total_profit, ROUND(SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END )::numeric, 2) AS total_loss, ROUND((SUM(CASE WHEN status = 'PROFIT' THEN 1 ELSE 0END)::numeric / COUNT(*) * 100), 2) AS trade_accuracy_percentage, ROUND(( ( SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_price - entry_price) * ( 100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END ) - SUM( CASE WHEN status = 'LOS S' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END ) )::numeric / 100000.0 * 100 ), 2) AS net_profit_percentage, ROUND((COUNT(*) * 60)::numeric, 2) AS total_charges, ROUND(( ( SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END ) - SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END ) - (COUNT(*) * 60) )::numeric / 100000.0 * 100 ), 2) AS final_profit_percentage FROM order_details WHERE status IN ('PROFIT', 'LOSS') GROUP BY date(timestamp) ORDER BY o
 -- SELECT DATE(timestamp) AS order_date, COUNT(*) AS total_trades, ROUND( SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END )::numeric, 2 ) AS total_profit, ROUND( SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END )::numeric, 2 ) AS total_loss, ROUND( (SUM(CASE WHEN status = 'PROFIT' THEN 1 ELSE 0 END)::numeric / COUNT(*) * 100), 2 ) AS trade_accuracy_percentage, ROUND( (( SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END ) - SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END ) )::numeric / 100000.0 * 100), 2 ) AS net_profit_percentage, ROUND((COUNT(*) * 60)::numeric, 2) AS total_charges, ROUND( (( SUM( CASE WHEN status = 'PROFIT' AND trade_type = 'BUY' THEN (exit_price - entry_price) * (100000 / exit_price) WHEN status = 'PROFIT' AND trade_type = 'SELL' THEN (entry_price - exit_price) * (100000 / exit_price) ELSE 0 END ) - SUM( CASE WHEN status = 'LOSS' AND trade_type = 'BUY' THEN (entry_price - exit_price) * (100000 / exit_price) WHEN status = 'LOSS' AND trade_type = 'SELL' THEN (exit_price - entry_price) * (100000 / exit_price) ELSE 0 END ) - (COUNT(*) * 60) )::numeric / 100000.0 * 100), 2 ) AS final_profit_percentage FROM order_details WHERE status IN ('PROFIT', 'LOSS') GROUP BY DATE(timestamp) ORDER BY order_date;
-ALTER TABLE order_details ADD COLUMN metadata_json JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE order_details ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE historical_data ADD COLUMN IF NOT EXISTS mfi FLOAT DEFAULT 0;
 ALTER TABLE historical_data ADD COLUMN IF NOT EXISTS adx FLOAT DEFAULT 0;
 ALTER TABLE historical_data ADD COLUMN IF NOT EXISTS rsi FLOAT DEFAULT 0;
@@ -127,13 +136,13 @@ ALTER TABLE historical_data ADD COLUMN IF NOT EXISTS vwap FLOAT DEFAULT 0;
 ALTER TABLE historical_data ADD COLUMN IF NOT EXISTS upperband FLOAT DEFAULT 0;
 ALTER TABLE historical_data ADD COLUMN IF NOT EXISTS middleband FLOAT DEFAULT 0;
 ALTER TABLE historical_data ADD COLUMN IF NOT EXISTS lowerband FLOAT DEFAULT 0;
-CREATE INDEX idx_stock_start_date_end_date ON support_resistance_levels (stock, start_date, end_date);
-ALTER TABLE order_details ADD COLUMN qty int default 0;
-ALTER TABLE order_details ADD COLUMN order_ids JSONB NOT NULL DEFAULT '[]';
-ALTER TABLE order_details ADD COLUMN order_status BOOLEAN DEFAULT FALSE;
+ALTER TABLE order_details ADD COLUMN IF NOT EXISTS qty int default 0;
+ALTER TABLE order_details ADD COLUMN IF NOT EXISTS order_ids JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE order_details ADD COLUMN IF NOT EXISTS order_status BOOLEAN DEFAULT FALSE;
+DROP INDEX IF EXISTS unique_stock_timestamp;
 ALTER TABLE historical_data ADD CONSTRAINT unique_stock_timestamp UNIQUE (stock, timestamp);
 
-CREATE TABLE capital_market_details (
+CREATE TABLE IF NOT EXISTS capital_market_details (
   epic VARCHAR(255) PRIMARY KEY,
   min_step_distance FLOAT,
   min_step_distance_unit VARCHAR(50),
@@ -169,4 +178,7 @@ BEFORE UPDATE ON capital_market_details
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
 
-ALTER TABLE capital_market_details ADD CONSTRAINT unique_epic UNIQUE (epic);
+-- For support_resistance_levels index
+DROP INDEX IF EXISTS idx_stock_start_date_end_date;
+CREATE INDEX IF NOT EXISTS idx_stock_start_date_end_date 
+    ON support_resistance_levels (stock, start_date, end_date);

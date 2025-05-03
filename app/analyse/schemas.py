@@ -25,7 +25,6 @@ class TradeAnalysisType(str, Enum):
 
 @dataclass
 class Trade:
-    deal_id: int
     id: int
     stock: str
     entry_ltp: float
@@ -36,6 +35,7 @@ class Trade:
     entry_time: datetime
     trade_type: CapitalTransactionType
     tag: str
+    deal_id: str
     metadata_json: dict
     order_ids: list
     order_status: bool
