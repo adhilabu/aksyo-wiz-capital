@@ -393,3 +393,8 @@ class CapitalComAPI:
         if search_term:
             params["searchTerm"] = search_term
         return await self.get("/api/v1/markets", params)
+    
+    async def fetch_epic_market_details(self, epic: str) -> Optional[Dict[str, Any]]:
+        """Fetch market details from Capital.com API for a specific instrument"""
+        url = f"/api/v1/markets/{epic}"
+        await self.get(url)

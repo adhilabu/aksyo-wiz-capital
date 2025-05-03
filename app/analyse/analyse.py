@@ -1,5 +1,6 @@
 import asyncio
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 import json
 import os
 from typing import Any, Optional
@@ -11,7 +12,7 @@ from finta import TA
 from talib import stream
 import talib
 import random
-from app.analyse.schemas import IndicatorValues, StockType, Trade, TradeAnalysisType, TradeStatus
+from app.analyse.schemas import CapitalMarketDetails, IndicatorValues, StockType, Trade, TradeAnalysisType, TradeStatus
 from app.analyse.pivots import find_support_resistance
 from app.database.db import DBConnection
 from app.notification.telegram import TelegramAPI
@@ -25,27 +26,21 @@ from fastapi import BackgroundTasks
 load_dotenv(dotenv_path=".env", override=True) 
 
 LOGGING_LEVEL = get_logging_level()
-WS_FEED_TYPE = os.getenv("WS_FEED_TYPE")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 HISTORY_DATA_PERIOD = int(os.getenv("HISTORY_DATA_PERIOD", 100))
 TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION", "False")
-STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 200000)
+STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 200)
 TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 
-def get_stocks_without_futures(stocks: list , instrument_future_map: dict):
-    futures = instrument_future_map.values()
-    return [s for s in stocks if s not in futures]
-
 class StockIndicatorCalculator:
-    CACHE_FILE = "market_holidays_cache.json"
-    TICK_SIZE = 0.05
+    TICK_SIZE = 0.01
     TRADE_PERC = 0.007
     MAX_ADJUSTMENTS = 3
     TOTAL_TRADES_LIMIT = 10
-    OPEN_TRADES_LIMIT = 4
+    OPEN_TRADES_LIMIT = 5
     LOSS_TRADE_LIMIT = 5
 
     def __init__(self, db_connection: DBConnection, redis_cache: RedisCache, start_date=None, end_date=None, test_mode=False):
@@ -61,6 +56,9 @@ class StockIndicatorCalculator:
         self.stock_reversal_data: dict[str, Any] = {}  # {stock_symbol: (high, low, timestamp)}
         self.index_reversal_data: dict[str, Any] = {}  # {index_symbol: (high, low, timestamp)}
         self.executed_breakouts = {}
+        self.stock_index_map = {}
+        self.stock_name_map = {}
+        self.stock_per_price_limit = float(STOCK_PER_PRICE_LIMIT)
 
     def set_and_get_dates(self, for_historical_data=False):
         self.db_con.end_date = self.end_date
@@ -92,8 +90,6 @@ class StockIndicatorCalculator:
                     await self.update_stock_data(row)
             except Exception as e:
                 self.logger.error(f"Error processing row: {e}")
-        # for _, row in transformed_data.iterrows():
-        #     await self.update_with_semaphore(row)
         tasks = [self.update_stock_data(row) for _, row in transformed_data.iterrows()]
         await asyncio.gather(*tasks)
         timestamp = transformed_data.iloc[0]['timestamp'] if len(transformed_data) > 0 else 'Empty'
@@ -101,7 +97,6 @@ class StockIndicatorCalculator:
 
     async def update_stock_data(self, data: pd.Series):
         stock = data['stock']
-        stock_type = self.get_stock_type(stock)
         timestamp = pd.to_datetime(data['timestamp'])
         existing_timestamps = await self.db_con.fetch_existing_timestamps(stock)
         if timestamp in existing_timestamps:
@@ -110,10 +105,8 @@ class StockIndicatorCalculator:
 
         self.logger.info(f"Inserting data for stock: {stock} and timestamp: {timestamp}.")
         await self.db_con.save_data_to_db(data.to_frame().T)
-        if stock_type == StockType.INDEX:
-            return
 
-        await self.analyze_reversal_breakout_strategy(stock)
+        await self.analyze_sma_strategy(stock)
         return
 
     def apply_tick_size(self, price: float) -> float:
@@ -123,18 +116,6 @@ class StockIndicatorCalculator:
     async def get_stock_ltp(self, stock, current_price):
         stock_ltp = await self.db_con.fetch_stock_ltp_from_db(stock) or current_price
         return self.apply_tick_size(stock_ltp)
-
-    async def transform_candle_data_to_df(self, stock: str, candles: dict):
-        transformed_data = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest'])
-        transformed_data['timestamp'] = pd.to_datetime(transformed_data['timestamp'])
-        transformed_data['timestamp'] = transformed_data['timestamp'].dt.tz_localize(None)
-        transformed_data['ltp'] = transformed_data['close']
-        transformed_data['stock'] = stock
-        transformed_data = transformed_data[['stock', 'close', 'volume', 'high', 'low', 'timestamp', 'ltp', 'open', 'open_interest']]
-        return transformed_data
-
-    def clean_empty_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.dropna(axis=1, how='all')
 
     async def transform_1_min_data_to_5_min_data(self, stock: str, in_data: pd.DataFrame):
         data = in_data.copy()
@@ -159,20 +140,8 @@ class StockIndicatorCalculator:
     async def process_combined_stock_data(self):
         for stock in self.epics:
             current_day_data = await self.capital_client.get_current_trading_day_data(stock)
-            # await self.calculate_pivot_data(combined_data)
+            await self.calculate_pivot_data(current_day_data)
             await self.db_con.save_data_to_db(current_day_data)
-
-    # async def process_combined_stock_data(self):
-    #     historical_data_map = self.capital_client.get_historical_data(self.epics)
-    #     for stock in self.epics:
-    #         if stock in historical_data_map:
-    #             current_day_data = await self.capital_client.get_current_trading_day_data(stock)
-    #             historical_data = historical_data_map[stock]
-    #             combined_data = pd.concat([historical_data, current_day_data], ignore_index=True)
-    #             await self.calculate_pivot_data(combined_data)
-    #             await self.db_con.save_data_to_db(combined_data)
-    #         else:
-    #             self.logger.warning(f"No historical data found for stock: {stock}.")
 
     async def calculate_mfi_talib(self, stock_data: pd.DataFrame, period=14) -> np.float64:
         if len(stock_data) <= 14:
@@ -250,45 +219,6 @@ class StockIndicatorCalculator:
                     break
 
         return pivot_broken, broken_level
-
-    async def get_base_payload_for_capital_order(self, epic: str, stock_ltp: float, stop_loss: float, profit_level: Optional[float] = None, trans_type: CapitalTransactionType = CapitalTransactionType.BUY, order_type: CapitalOrderType = CapitalOrderType.MARKET, quantity: int = None) -> Optional[BasicPlaceOrderCapital]:
-        """Creates the base payload object for placing a Capital.com order."""
-        if stock_ltp <= 0:
-            self.logger.warning(f"Invalid LTP {stock_ltp} for {epic}. Cannot calculate quantity.")
-            return None
-            
-        if stock_ltp > self.stock_per_price_limit:
-            self.logger.info(f"Price: {stock_ltp} is greater than the stock {epic} per price limit: {self.stock_per_price_limit}.")
-            return None
-        
-        # Calculate quantity based on price limit if not provided
-        quantity = int(self.stock_per_price_limit // stock_ltp) if quantity is None else quantity
-        if quantity <= 0:
-             self.logger.warning(f"Calculated quantity is zero or negative for {epic} at LTP {stock_ltp}. Skipping order.")
-             return None
-
-        # Use the specific price for LIMIT/STOP orders, LTP might be used differently
-        price_for_order = stock_ltp if order_type in [CapitalOrderType.LIMIT, CapitalOrderType.STOP] else None 
-
-        return BasicPlaceOrderCapital(
-            quantity=quantity,
-            price=price_for_order, # Price level for LIMIT/STOP orders
-            epic=epic,
-            order_type=order_type,
-            transaction_type=trans_type,
-            stop_loss=stop_loss,
-            profit_level=profit_level # Add profit level if available
-        )
-        
-    def follows_the_trend(self, indicator_values: IndicatorValues):
-        """ Check if the stock follows the trend based on the indicator values. """
-        return indicator_values.rsi > 70 and indicator_values.adx > 25 and (indicator_values.mfi > 80 or indicator_values.stock_type == StockType.INDEX)
-
-    def get_stock_type(self, stock: str):
-        indices: list = list(self.indices_stocks_map.keys()) + [NIFTY_50_SYMBOL]
-        if stock in indices:
-            return StockType.INDEX
-        return StockType.EQUITY
 
     async def check_and_execute_exit_trade_type_2(self, stock_data: pd.DataFrame):
         """Check and execute exit conditions for open trades based on strategy type 2."""
@@ -372,6 +302,7 @@ class StockIndicatorCalculator:
         # Batch update DB for executed exits
         if executed_trades_updates:
             await self.db_con.update_trade_statuses(executed_trades_updates)
+
     async def _handle_eod_square_off(self, timestamp: datetime, stock: str, close_price: float) -> bool:
         """Handle end-of-day position squaring."""
         if timestamp >= timestamp.replace(hour=15, minute=0):
@@ -518,6 +449,7 @@ class StockIndicatorCalculator:
         else:
             self.logger.error(f"Failed to initiate exit request for trade {trade.id} (Deal ID: {trade.deal_id})")
             return None  
+
     async def get_index_5min_df(self, stock: str, start_date=None, end_date=None):
         index = self.stock_index_map.get(stock)
         if index is None:
@@ -529,68 +461,6 @@ class StockIndicatorCalculator:
 
         index_data: pd.DataFrame = await self.db_con.load_data_from_db(index, start_date, end_date)
         return await self.transform_1_min_data_to_5_min_data(index, index_data)
-
-    async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY'):
-        stock = stock_data['stock']
-        redis_key = f"message:{stock}"
-        stock_name = self.stock_name_map.get(stock, stock)
-        formatted_date_time = stock_data['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
-        ist_timezone = pytz.timezone('Asia/Kolkata')
-        current_time = datetime.now(ist_timezone).strftime("%Y-%m-%d %H:%M:%S")
-        if self.test_mode:
-            message = (
-                "Test Mode\n"
-                f"Stock: {stock_name}\n"
-                f"LTP: {stock_data['ltp']}\n"
-                f"Action: {trade_type.value}\n"
-                f"SL: {sl}\n"
-                f"PL: {pl}\n"
-                f"Broke Resistance: {broken_level}\n"
-                f"RSI: {round(indicator_values.rsi, 2)}\n"
-                f"ADX: {round(indicator_values.adx, 2)}\n"
-                f"MFI: {round(indicator_values.mfi, 2)}\n"
-                f"Stock Date & Time: {formatted_date_time}\n"
-                f"MSG Date & Time: {current_time}"
-
-            )
-
-            if TELEGRAM_NOTIFICATION.lower() == "true":
-                telegram_api = TelegramAPI(TELEGRAM_TOKEN)
-                telegram_api.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                self.redis_cache.set_key(redis_key, 1, ttl=1800)
-                self.logger.info("Telegram notification sent successfully.")
-
-        
-            with open(self.filename, "a") as f:
-                f.write(f"{message}\n\n")
-                return
-
-        message = (
-            f"Stock: {stock_name}\n"
-            f"LTP: {stock_data['ltp']}\n"
-            f"Action: {trade_type.value}\n"
-            f"SL: {sl}\n"
-            f"PL: {pl}\n"
-            f"Broke Resistance: {broken_level}\n"
-            f"RSI: {round(indicator_values.rsi, 2)}\n"
-            f"ADX: {round(indicator_values.adx, 2)}\n"
-            f"MFI: {round(indicator_values.mfi, 2)}\n"
-            f"Stock Date & Time: {formatted_date_time}\n"
-            f"MSG Date & Time: {current_time}"
-        )
-
-        with open(self.filename, "a") as f:
-            f.write(f"{message}\n\n")
-
-        if self.redis_cache.key_exists(redis_key):
-            self.logger.info(f"Telegram notification already sent for stock: {stock}.")
-            return
-
-        if TELEGRAM_NOTIFICATION.lower() == "true":
-            telegram_api = TelegramAPI(TELEGRAM_TOKEN)
-            telegram_api.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-            self.redis_cache.set_key(redis_key, 1, ttl=1800)
-            self.logger.info("Telegram notification sent successfully.")
 
     async def identify_candle_color_reversal(self, stock_data_5_min):
         """Identifies the first candle color reversal and tracks breakout status."""
@@ -762,19 +632,115 @@ class StockIndicatorCalculator:
             just_created = True
         return just_created, reversal_data
 
-    async def calculate_sl_for_breakout(self, direction, entry_price):
-        """Calculate SL as 0.8% of entry price"""
-        sl_percent = self.TRADE_PERC
-        if direction == CapitalTransactionType.BUY:
-            return entry_price * (1 - sl_percent)
-        return self.apply_tick_size(entry_price * (1 + sl_percent))
+    async def ensure_market_details(self, epic: str) -> Optional[CapitalMarketDetails]:
+        """Ensure market details are available, fetching from API if necessary"""
+        market_data = await self.db_con.get_capital_market_details(epic)
+        if market_data:
+            return market_data
 
-    async def calculate_pl_for_breakout(self, direction, entry_price):
-        """Calculate PL as 0.8% of entry price"""
-        pl_percent = self.TRADE_PERC
+        # Fetch from API if not found in DB
+        return await self.capital_client.get_instrument_details(epic)
+
+    async def calculate_sl_for_breakout(self, direction: CapitalTransactionType, entry_price: float, epic: str, details: CapitalMarketDetails) -> float:        
+        # Calculate step size in points
+        min_step = details.min_step_distance
+        if details.min_step_distance_unit == 'PERCENTAGE':
+            step = entry_price * (min_step / 100)
+        else:
+            step = min_step
+        
+        sl_percent = self.TRADE_PERC  # e.g., 0.8%
         if direction == CapitalTransactionType.BUY:
-            return entry_price * (1 + pl_percent)
-        return self.apply_tick_size(entry_price * (1 - pl_percent))
+            desired_sl = entry_price * (1 - sl_percent)
+            min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
+            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+            current_distance = entry_price - desired_sl
+        else:
+            desired_sl = entry_price * (1 + sl_percent)
+            min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
+            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+            current_distance = desired_sl - entry_price
+        
+        # Apply min/max constraints
+        if current_distance < min_distance:
+            desired_sl = entry_price - min_distance if direction == CapitalTransactionType.BUY else entry_price + min_distance
+        elif current_distance > max_distance:
+            desired_sl = entry_price - max_distance if direction == CapitalTransactionType.BUY else entry_price + max_distance
+        
+        # Round to nearest step
+        return round(desired_sl / step) * step if step != 0 else desired_sl
+
+    async def calculate_pl_for_breakout(self, direction: CapitalTransactionType, entry_price: float, epic: str, details: CapitalMarketDetails) -> float:        
+        # Calculate step size
+        min_step = details.min_step_distance
+        if details.min_step_distance_unit == 'PERCENTAGE':
+            step = entry_price * (min_step / 100)
+        else:
+            step = min_step
+        
+        # Strategy PL percentage (double SL)
+        pl_percent = self.TRADE_PERC * 2  # e.g., 1.6%
+        if direction == CapitalTransactionType.BUY:
+            desired_pl = entry_price * (1 + pl_percent)
+            min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
+            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+            current_distance = desired_pl - entry_price
+        else:
+            desired_pl = entry_price * (1 - pl_percent)
+            min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
+            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+            current_distance = entry_price - desired_pl
+        
+        # Apply constraints
+        if current_distance < min_distance:
+            desired_pl = entry_price + min_distance if direction == CapitalTransactionType.BUY else entry_price - min_distance
+        elif current_distance > max_distance:
+            desired_pl = entry_price + max_distance if direction == CapitalTransactionType.BUY else entry_price - max_distance
+        
+        return round(desired_pl / step) * step if step != 0 else desired_pl
+
+    async def get_base_payload_for_capital_order(self, epic: str, stock_ltp: float, 
+                                            trans_type: CapitalTransactionType = CapitalTransactionType.BUY, 
+                                            order_type: CapitalOrderType = CapitalOrderType.MARKET) -> Optional[BasicPlaceOrderCapital]:
+        if stock_ltp <= 0:
+            self.logger.warning(f"Invalid LTP {stock_ltp} for {epic}")
+            return None
+        
+        # Fetch instrument details to ensure rules are loaded
+        market_details = await self.ensure_market_details(epic)
+        
+        # Calculate dynamic SL/PL
+        stop_loss = await self.calculate_sl_for_breakout(trans_type, stock_ltp, epic, market_details)
+        profit_level = await self.calculate_pl_for_breakout(trans_type, stock_ltp, epic, market_details)
+        
+        # Quantity calculation
+        quantity = int(self.stock_per_price_limit // stock_ltp)
+        
+        # Validate quantity against market rules
+        if market_details:
+            if quantity < market_details.min_deal_size:
+                self.logger.warning(f"Calculated quantity {quantity} is below minimum deal size {market_details.min_deal_size} for {epic}.")
+                quantity = int(market_details.min_deal_size)
+            elif quantity > market_details.max_deal_size:
+                self.logger.warning(f"Calculated quantity {quantity} exceeds maximum deal size {market_details.max_deal_size} for {epic}.")
+                quantity = int(market_details.max_deal_size)
+            
+            # Round to the nearest valid increment
+            quantity = int(quantity // market_details.min_size_increment * market_details.min_size_increment)
+        
+        if quantity <= 0:
+            self.logger.warning(f"Calculated quantity is zero or negative for {epic} at LTP {stock_ltp}. Skipping order.")
+            return None
+
+        return BasicPlaceOrderCapital(
+            quantity=quantity,
+            price=stock_ltp if order_type in [CapitalOrderType.LIMIT, CapitalOrderType.STOP] else None,
+            epic=epic,
+            order_type=order_type,
+            transaction_type=trans_type,
+            stop_loss=stop_loss,
+            profit_level=profit_level
+        )
 
     async def calculate_atr(self, stock_data_5_min, period=14):
         """Calculate Average True Range for volatility measurement."""
@@ -817,67 +783,23 @@ class StockIndicatorCalculator:
             self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
             return
     
-        if (final_timestamp.minute + 1) % 5 != 0:
-            return
-        
-        if final_timestamp <= final_timestamp.replace(hour=9, minute=23):
-            return
-
-        if final_timestamp >= final_timestamp.replace(hour=11, minute=00):
-            return
-
         results = await self.db_con.get_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT, total_count=self.TOTAL_TRADES_LIMIT)
         if any(results):
-            self.logger.info(f"HN :{stock}: Condition met, skipping trade")
-            return
-
-        # Existing data processing remains unchanged
-        stock_data_5_min = await self.transform_1_min_data_to_5_min_data(stock, stock_data)
-        if stock_data_5_min.empty:
-            return
-        
-        just_created, reversal_data = await self.get_or_calculate_reversal_data(stock, stock_data_5_min)
-        if not reversal_data:
-            return
-        
-        if just_created:
-            return
-        
-        reversal_high, reversal_low, reversal_time = reversal_data
-        if reversal_time == final_timestamp:
+            self.logger.info(f"RH: {stock}: Condition met, skipping trade")
             return
         
         current_price = final_stock_data['ltp']
         breakout_direction = None
-        
-        if current_price > reversal_high:
-            breakout_direction = CapitalTransactionType.BUY # Use Capital enum
-            breakout_level = reversal_high
-        elif current_price < reversal_low:
-            breakout_direction = CapitalTransactionType.SELL # Use Capital enum
-            breakout_level = reversal_low
-        else:
-            return
-        
-        # if not await self.valid_market_sentiment(breakout_direction):
-        #     self.logger.info(f"HN {stock}: Market sentiment does not confirm the breakout direction")
-        #     return
 
-        # Mark breakout as executed for today
-        self.executed_breakouts[stock] = True
-
-        if not await self.check_index_confirmation(stock, breakout_direction, reversal_time):
-            self.logger.info(f"HN {stock}: Index does not confirm the breakout direction")
-            return
         
-        pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data_5_min, breakout_direction)
+        pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data, breakout_direction)
         if not pivot_broken:
-            self.logger.info(f"HN {stock}: Didn't broke any pivot levels")
+            self.logger.info(f"RH: stock: Didn't broke any pivot levels")
             return
         
 
         # Calculate dynamic position size based on volatility
-        atr = await self.calculate_atr(stock_data_5_min)
+        atr = await self.calculate_atr(stock_data)
         
         # In analyze_reversal_breakout_strategy:
         stock_ltp = await self.get_stock_ltp(stock, current_price)
@@ -897,8 +819,6 @@ class StockIndicatorCalculator:
         if not base_payload:
             return
         
-        stock_name = self.stock_name_map.get(stock, stock)
-
         await asyncio.sleep(random.uniform(0, 1))
 
         # # Redis keys
@@ -924,41 +844,41 @@ class StockIndicatorCalculator:
         #     # Revert: delete stock key and decrement count
         #     self.redis_cache.client.delete(stock_ts_key)
         #     self.redis_cache.client.decr(ts_count_key)
-        #     self.logger.info(f"HN Max trades (2) reached for {final_timestamp}. Skipping.")
+        #     self.logger.info(f"RH: ax trades (2) reached for {final_timestamp}. Skipping.")
         #     return
 
         # Check existing open trades
         if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("HN: Max open trades reached. Skipping.")
+            self.logger.info("RH: Max open trades reached. Skipping.")
             # self.redis_cache.client.delete(stock_ts_key)
             # self.redis_cache.client.decr(ts_count_key)
             return
 
         # Check existing open trades
         if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
-            self.logger.info("HN: Max loss trades reached. Skipping.")
+            self.logger.info("RH: Max loss trades reached. Skipping.")
             # self.redis_cache.client.delete(stock_ts_key)
             # self.redis_cache.client.decr(ts_count_key)
             return
         
         # Place order and log trade
         rsi, adx, mfi = await asyncio.gather(
-            self.calculate_rsi_talib(stock_data_5_min),
-            self.calculate_adx_talib(stock_data_5_min),
-            self.calculate_mfi_talib(stock_data_5_min)
+            self.calculate_rsi_talib(stock_data),
+            self.calculate_adx_talib(stock_data),
+            self.calculate_mfi_talib(stock_data)
         )
         
         indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
         await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, sl, pl, breakout_direction)
         if self.is_invalid_momentum_trade(indicator_values):
-            self.logger.info("HN: Invalid trade based on momentum. Skipping.")
+            self.logger.info("RH: Invalid trade based on momentum. Skipping.")
             return
 
         metadata_json = {
             "atr": atr
         }
 
-        order_ids = await self.upstox_client.place_order_v3(base_payload)
+        await self.capital_client.place_order(base_payload)
         await self.db_con.log_trade_to_db(
             final_stock_data,
             indicator_values,
@@ -966,12 +886,186 @@ class StockIndicatorCalculator:
             sl,
             pl,
             breakout_direction,
-            stock_name,
+            stock,
             metadata_json,
             base_payload.quantity,
             order_status=True if self.test_mode else False,
-            order_ids=order_ids,
+            order_ids=[],
             stock_ltp=stock_ltp
         )
 
-        self.logger.info(f"HN : High-probability trade executed for {stock}: ")
+        self.logger.info(f"RH:  High-probability trade executed for {stock}: ")
+
+    async def analyze_sma_strategy(self, stock) -> None:
+        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=5), self.end_date)
+        if stock_data.empty:
+            return
+
+        final_stock_data = stock_data.iloc[-1]
+        
+        # Existing checks remain unchanged
+        await self.check_and_execute_exit_trade_type_2(final_stock_data)
+        if stock in self.executed_breakouts and self.executed_breakouts[stock]:
+            self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
+            return
+        
+        results = await self.db_con.get_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT, total_count=self.TOTAL_TRADES_LIMIT)
+        if any(results):
+            self.logger.info(f"SMA: {stock}: Condition met, skipping trade")
+            return
+        
+        current_price = final_stock_data['ltp']
+        breakout_direction = None
+
+        # Calculate 13-period and 200-period SMAs using closing prices
+        stock_data['sma13'] = stock_data['close'].rolling(window=13).mean()
+        stock_data['sma200'] = stock_data['close'].rolling(window=200).mean()
+        
+        # Extract latest SMA values and closing price
+        sma13 = stock_data['sma13'].iloc[-1]
+        sma200 = stock_data['sma200'].iloc[-1]
+        latest_close = final_stock_data['close']
+        prev_close = stock_data['close'].iloc[-2]
+        
+        # Check if SMAs are valid (not NaN)
+        if pd.isna(sma13) or pd.isna(sma200):
+            self.logger.info(f"SMA: {stock}: Insufficient data to calculate SMAs. Skipping.")
+            return
+
+        breakout_direction = CapitalTransactionType.BUY
+        broken_level = sma13  # Using 200 SMA as confirmation level
+
+        if latest_close > sma13 and latest_close > sma200 and prev_close < sma13:
+            breakout_direction = CapitalTransactionType.BUY
+        elif latest_close < sma13 and latest_close < sma200 and prev_close > sma13:
+            breakout_direction = CapitalTransactionType.SELL
+        else:
+            self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
+            return
+
+        # pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data, breakout_direction)
+        # if not pivot_broken:
+        #     self.logger.info(f"SMA: stock: Didn't broke any pivot levels")
+        #     return
+
+        # Determine SL and PL based on breakout direction
+        stock_ltp = await self.get_stock_ltp(stock, current_price)
+        # Prepare order payload
+        base_payload = await self.get_base_payload_for_capital_order(
+            epic=stock,
+            stock_ltp=stock_ltp,
+            trans_type=breakout_direction,
+            order_type=CapitalOrderType.LIMIT
+        )
+        
+        if not base_payload:
+            return
+        
+        await asyncio.sleep(random.uniform(0, 1))
+
+        # Check open trade limits
+        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+            self.logger.info("SMA: Max open trades reached. Skipping.")
+            return
+
+        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+            self.logger.info("SMA: Max loss trades reached. Skipping.")
+            return
+        
+        # Calculate momentum indicators
+        rsi, adx, mfi = await asyncio.gather(
+            self.calculate_rsi_talib(stock_data),
+            self.calculate_adx_talib(stock_data),
+            self.calculate_mfi_talib(stock_data)
+        )
+        
+        indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
+        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, sl, pl, breakout_direction)
+
+        # Prepare metadata including ATR and SMAs
+        metadata_json = {
+            "sma13": sma13,
+            "sma200": sma200
+        }
+
+        # Place order and log trade
+        await self.capital_client.place_order(base_payload)
+        await self.db_con.log_trade_to_db(
+            final_stock_data,
+            indicator_values,
+            broken_level,
+            base_payload.stop_loss,
+            base_payload.profit_level,
+            breakout_direction,
+            stock,
+            metadata_json,
+            base_payload.quantity,
+            order_status=True if self.test_mode else False,
+            order_ids=[],
+            stock_ltp=stock_ltp
+        )
+
+        self.logger.info(f"SMA: High-probability trade executed for {stock}: Direction {breakout_direction}")
+
+
+    async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY'):
+        stock = stock_data['stock']
+        redis_key = f"message:{stock}"
+        stock_name = self.stock_name_map.get(stock, stock)
+        formatted_date_time = stock_data['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+        ist_timezone = pytz.timezone('Asia/Kolkata')
+        current_time = datetime.now(ist_timezone).strftime("%Y-%m-%d %H:%M:%S")
+        if self.test_mode:
+            message = (
+                "Test Mode\n"
+                f"Stock: {stock_name}\n"
+                f"LTP: {stock_data['ltp']}\n"
+                f"Action: {trade_type.value}\n"
+                f"SL: {sl}\n"
+                f"PL: {pl}\n"
+                f"Broke Resistance: {broken_level}\n"
+                f"RSI: {round(indicator_values.rsi, 2)}\n"
+                f"ADX: {round(indicator_values.adx, 2)}\n"
+                f"MFI: {round(indicator_values.mfi, 2)}\n"
+                f"Stock Date & Time: {formatted_date_time}\n"
+                f"MSG Date & Time: {current_time}"
+
+            )
+
+            if TELEGRAM_NOTIFICATION.lower() == "true":
+                telegram_api = TelegramAPI(TELEGRAM_TOKEN)
+                telegram_api.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                self.redis_cache.set_key(redis_key, 1, ttl=1800)
+                self.logger.info("Telegram notification sent successfully.")
+
+        
+            with open(self.filename, "a") as f:
+                f.write(f"{message}\n\n")
+                return
+
+        message = (
+            f"Stock: {stock_name}\n"
+            f"LTP: {stock_data['ltp']}\n"
+            f"Action: {trade_type.value}\n"
+            f"SL: {sl}\n"
+            f"PL: {pl}\n"
+            f"Broke Resistance: {broken_level}\n"
+            f"RSI: {round(indicator_values.rsi, 2)}\n"
+            f"ADX: {round(indicator_values.adx, 2)}\n"
+            f"MFI: {round(indicator_values.mfi, 2)}\n"
+            f"Stock Date & Time: {formatted_date_time}\n"
+            f"MSG Date & Time: {current_time}"
+        )
+
+        with open(self.filename, "a") as f:
+            f.write(f"{message}\n\n")
+
+        if self.redis_cache.key_exists(redis_key):
+            self.logger.info(f"Telegram notification already sent for stock: {stock}.")
+            return
+
+        if TELEGRAM_NOTIFICATION.lower() == "true":
+            telegram_api = TelegramAPI(TELEGRAM_TOKEN)
+            telegram_api.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+            self.redis_cache.set_key(redis_key, 1, ttl=1800)
+            self.logger.info("Telegram notification sent successfully.")

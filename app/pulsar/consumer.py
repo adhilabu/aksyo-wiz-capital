@@ -73,8 +73,8 @@ class PulsarConsumer:
                     self.consumer.batch_receive
                 )
 
-                for msg in batch:
-                    await self.process_message(msg)
+                if batch:
+                    await self.process_message(batch)
             except PulsarException as e:
                 print(f"Pulsar error: {e}. Reconnecting...")
                 await self._safe_reconnect()
@@ -94,12 +94,10 @@ class PulsarConsumer:
 
     async def process_message(self, msg):
         """Process a single message."""
-        try:
-            data = json.loads(msg.data().decode("utf-8"))
-            self.consumer.acknowledge(msg)
-
-            # if not filter_data_by_interval(data):
-            #     return
+        try:  
+            data = [ json.loads(m.data().decode("utf-8")) for m in msg ]
+            for m in msg:
+                self.consumer.acknowledge(m)
 
             transformed_data = transform_capital_ohlc(data)
             if transformed_data.empty:

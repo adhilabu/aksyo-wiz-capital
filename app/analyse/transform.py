@@ -90,34 +90,37 @@ def transform_data(json_data) -> pd.DataFrame:
     return transformed_data
 
 
-def transform_capital_ohlc(json_data) -> pd.DataFrame:
+def transform_capital_ohlc(payload) -> pd.DataFrame:
     """
     Transforms a Capital.com WebSocket OHLC message into a structured Pandas DataFrame.
     """
     try:
-        payload = json_data.get("payload", {})
         if not payload:
             return pd.DataFrame()  # Return empty DataFrame if payload is missing
 
-        utc_dt = datetime.fromtimestamp(payload["t"] / 1000, tz=timezone.utc)
-        ist_dt = utc_dt.astimezone(pytz.timezone("Asia/Kolkata"))
+        transformed_data = []
+        for data in payload:
+            utc_dt = datetime.fromtimestamp(data["t"] / 1000, tz=timezone.utc)
+            ist_dt = utc_dt.astimezone(pytz.timezone("Asia/Kolkata"))
 
-        data = {
-            "stock": payload.get("epic"),
-            "type": payload.get("type"),
-            "price_type": payload.get("priceType"),
-            "resolution": payload.get("resolution"),
-            "timestamp": ist_dt.replace(tzinfo=None),  # Remove timezone info for consistency
-            "open": payload.get("o"),
-            "high": payload.get("h"),
-            "low": payload.get("l"),
-            "close": payload.get("c"),
-            "volume": int(payload.get("vol", 0)),
-            "ltp": payload.get("ltp"),
-            "open_interest": payload.get("openInterest", 0)            
-        }
+            t_data = {
+                "stock": data.get("epic"),
+                "type": data.get("type"),
+                "price_type": data.get("priceType"),
+                "resolution": data.get("resolution"),
+                "timestamp": ist_dt.replace(tzinfo=None),  # Remove timezone info for consistency
+                "open": data.get("o"),
+                "high": data.get("h"),
+                "low": data.get("l"),
+                "close": data.get("c"),
+                "volume": int(data.get("vol", 0)),
+                "ltp": data.get("c"),
+                "open_interest": data.get("openInterest", 0)            
+            }
 
-        return pd.DataFrame([data])
+            transformed_data.append(t_data)
+
+        return pd.DataFrame(transformed_data)
 
     except Exception as e:
         print(f"Error transforming data: {e}")

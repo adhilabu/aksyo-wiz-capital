@@ -5,6 +5,7 @@ import os
 from typing import Any, List, Optional, Dict
 
 import pytz
+from app.analyse.schemas import CapitalMarketDetails
 from app.database.db import DBConnection
 from app.capital.capital_com import CapitalComAPI
 from app.capital.schemas import BasicPlaceOrderCapital, CapitalOrderType, CapitalTransactionType, CapitalMarketResolution
@@ -64,25 +65,22 @@ class CapitalAPI:
         """Transforms Capital.com price history list into a pandas DataFrame [timestamp, open, high, low, close, volume]."""
         records = []
         for price_point in prices:
-            # Use mid-price (average of bid and ask) or just bid/ask? Using bid for consistency example.
-            # Timestamps need parsing. Assuming UTC format like 'YYYY-MM-DDTHH:MM:SS'
             try:
-                ts_str = price_point.get(	'snapshotTimeUTC	')
-                # Attempt to parse with or without milliseconds
+                ts_str = price_point.get('snapshotTimeUTC')
                 try:
-                    ts = pd.to_datetime(ts_str, format=	'%Y-%m-%dT%H:%M:%S.%f	', errors=	'raise	')
+                    ts = pd.to_datetime(ts_str, format='%Y-%m-%dT%H:%M:%S.%f', errors='raise')
                 except ValueError:
-                    ts = pd.to_datetime(ts_str, format=	'%Y-%m-%dT%H:%M:%S	', errors=	'raise	')
+                    ts = pd.to_datetime(ts_str, format='%Y-%m-%dT%H:%M:%S', errors='raise')
                 
-                # Ensure timezone is handled (Capital.com uses UTC)
-                # Convert to naive datetime if analyse.py expects it, or keep tz-aware
+                # Convert to IST timezone
+                ts = ts.tz_localize('UTC').tz_convert('Asia/Kolkata')
                 ts = ts.tz_localize(None) # Making naive for compatibility with original code
 
-                o = price_point.get(	'openPrice	', {}).get(	'bid	')
-                h = price_point.get(	'highPrice	', {}).get(	'bid	')
-                l = price_point.get(	'lowPrice	', {}).get(	'bid	')
-                c = price_point.get(	'closePrice	', {}).get(	'bid	')
-                v = price_point.get(	'lastTradedVolume	')
+                o = price_point.get('openPrice', {}).get('bid')
+                h = price_point.get('highPrice', {}).get('bid')
+                l = price_point.get('lowPrice', {}).get('bid')
+                c = price_point.get('closePrice', {}).get('bid')
+                v = price_point.get('lastTradedVolume')
 
                 if all(val is not None for val in [ts, o, h, l, c, v]):
                     records.append([ts, o, h, l, c, v])
@@ -93,16 +91,16 @@ class CapitalAPI:
                 continue
 
         if not records:
-            return pd.DataFrame(columns=[	'timestamp	', 	'open	', 	'high	', 	'low	', 	'close	', 	'volume	'])
+            return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-        df = pd.DataFrame(records, columns=[	'timestamp	', 	'open	', 	'high	', 	'low	', 	'close	', 	'volume	'])
-        df = df.sort_values(by=	'timestamp	').reset_index(drop=True)
+        df = pd.DataFrame(records, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df = df.sort_values(by='timestamp').reset_index(drop=True)
         # Add 'stock' and 'ltp' columns as expected by analyse.py
-        df[	'stock	'] = epic
-        df[	'ltp	'] = df[	'close	'] # Use close price as LTP for historical data
+        df['stock'] = epic
+        df['ltp'] = df['close'] # Use close price as LTP for historical data
         # Add other columns if needed, e.g., open_interest (usually 0 for non-futures)
-        df[	'open_interest	'] = 0 
-        df = df[[	'stock	', 	'open	', 	'high	', 	'low	', 	'close	', 	'volume	', 	'open_interest	', 	'timestamp	', 	'ltp	']]
+        df['open_interest'] = 0 
+        df = df[['stock', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'timestamp', 'ltp']]
         return df
 
     async def get_recent_data(self, epic: str, start_dt_str: str, end_dt_str: str, interval: str = 	'1minute') -> pd.DataFrame:
@@ -119,10 +117,8 @@ class CapitalAPI:
         
         try:
             response = await self.client.get_price_history(**request_payload)
-            status_code = 200 # Assuming success if no exception
-            # await self.log_request_response(f"/api/v1/prices/{epic}", request_payload, response, status_code)
             
-            prices = response.get(	'prices	', [])
+            prices = response.get('prices', [])
             if not prices:
                 logger.warning(f"No historical prices returned for {epic} in the specified range.")
                 return pd.DataFrame()
@@ -132,25 +128,14 @@ class CapitalAPI:
             
         except Exception as e:
             logger.error(f"Error fetching historical data for {epic}: {e}")
-            # await self.log_request_response(f"/api/v1/prices/{epic}", request_payload, {"error": str(e)}, 500)
             return pd.DataFrame()
 
     async def get_current_trading_day_data(self, epic: str, interval: str = '1minute') -> pd.DataFrame:
         """Fetch intraday data for the current day."""
-        # end_dt_str = datetime.now().replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
-        # start_dt_str = (datetime.now() - pd.Timedelta(minutes=900)).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
-        # Rewrite both in UTC
         end_dt_str = datetime.now(pytz.UTC).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
         start_dt_str = (datetime.now(pytz.UTC) - pd.Timedelta(minutes=900)).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
         logger.info(f"Fetching current trading day data for {epic} ({end_dt_str}) - ({start_dt_str}) with interval {interval}")
         return await self.get_recent_data(epic, start_dt_str, end_dt_str, interval)
-
-    def get_market_holidays(self):
-        """Fetch market holidays. Capital.com might not have a direct equivalent. Find alternative source or omit."""
-        # Capital.com API docs don't explicitly list a holiday endpoint.
-        # May need to fetch from another source (e.g., NSE website) or handle trading times directly.
-        logger.warning("Market holiday endpoint not directly available in Capital.com API. Consider alternative sources.")
-        return []
 
     def _map_order_to_position_payload(self, basic_order: BasicPlaceOrderCapital) -> dict:
         """Maps the internal order schema to the Capital.com API payload for creating a position (MARKET order)."""
@@ -177,7 +162,7 @@ class CapitalAPI:
             "level": basic_order.price, # The price for LIMIT/STOP
             "type": basic_order.order_type.value, # LIMIT or STOP
             "goodTillDate": None, # Or set an expiry, e.g., (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%S')
-            "guaranteedStop": False,
+            "guaranteedStop": True,
         }
         if basic_order.stop_loss:
             payload["stopLevel"] = basic_order.stop_loss
@@ -194,11 +179,11 @@ class CapitalAPI:
 
         try:
             if basic_order.order_type == CapitalOrderType.MARKET:
-                endpoint = "/api/v1/positions/otc" # OTC endpoint for market orders
+                endpoint = "/api/v1/positions" # OTC endpoint for market orders
                 payload = self._map_order_to_position_payload(basic_order)
                 response = await self.client.post(endpoint, data=payload)
             elif basic_order.order_type in [CapitalOrderType.LIMIT, CapitalOrderType.STOP]:
-                endpoint = "/api/v1/workingorders/otc" # OTC endpoint for working orders
+                endpoint = "/api/v1/workingorders" # OTC endpoint for working orders
                 payload = self._map_order_to_working_order_payload(basic_order)
                 response = await self.client.post(endpoint, data=payload)
             else:
@@ -206,7 +191,7 @@ class CapitalAPI:
                 return None
 
             status_code = 200 # Assuming success if no exception
-            # await self.log_request_response(endpoint, payload, response, status_code)
+            await self.log_request_response(endpoint, payload, response, status_code)
             
             deal_reference = response.get("dealReference")
             if deal_reference:
@@ -439,13 +424,12 @@ class CapitalAPI:
         endpoint = "/api/v1/accounts"
         try:
             response = await self.client.get(endpoint)
-            accounts = response.get(	'accounts	', [])
+            accounts = response.get('accounts', [])
             logger.debug(f"Fetched details for {len(accounts)} accounts.")
             return accounts
         except Exception as e:
             logger.error(f"Error fetching account details: {e}")
             return []
-
 
     def get_historical_data(self, instruments):
         """
@@ -482,3 +466,84 @@ class CapitalAPI:
                 print(f"Error fetching data for {symbol} (ticker: {ticker}): {e}")
         
         return data
+
+    async def get_instrument_details(self, epic: str) -> Optional[CapitalMarketDetails]:        
+        # Fetch from Capital API
+        instrument_data = await self.client.fetch_epic_market_details(epic)
+        if not instrument_data:
+            return None
+
+        dealing_rules = instrument_data.get('dealingRules', {})
+        snapshot = instrument_data.get('snapshot', {})
+        capital_market_details = CapitalMarketDetails(
+            epic=epic,
+            min_step_distance=dealing_rules.get('minStepDistance', {}).get('value'),
+            min_step_distance_unit=dealing_rules.get('minStepDistance', {}).get('unit'),
+            min_deal_size=dealing_rules.get('minDealSize', {}).get('value'),
+            min_deal_size_unit=dealing_rules.get('minDealSize', {}).get('unit'),
+            max_deal_size=dealing_rules.get('maxDealSize', {}).get('value'),
+            max_deal_size_unit=dealing_rules.get('maxDealSize', {}).get('unit'),
+            min_size_increment=dealing_rules.get('minSizeIncrement', {}).get('value'),
+            min_size_increment_unit=dealing_rules.get('minSizeIncrement', {}).get('unit'),
+            min_guaranteed_stop_distance=dealing_rules.get('minGuaranteedStopDistance', {}).get('value'),
+            min_guaranteed_stop_distance_unit=dealing_rules.get('minGuaranteedStopDistance' , {}).get('unit'),
+            min_stop_or_profit_distance=dealing_rules.get('minStopOrProfitDistance', {}).get('value'),
+            min_stop_or_profit_distance_unit=dealing_rules.get('minStopOrProfitDistance', {}).get('unit'),
+            max_stop_or_profit_distance=dealing_rules.get('maxStopOrProfitDistance', {}).get('value'),
+            max_stop_or_profit_distance_unit=dealing_rules.get('maxStopOrProfitDistance', {}).get('unit'),
+            decimal_places=snapshot.get('decimalPlaces'),
+            margin_factor=snapshot.get('marginFactor')
+        )
+
+        # Save to database
+        await self.db_conn.execute(
+            """
+            INSERT INTO capital_market_details 
+            (epic, min_step_distance, min_step_distance_unit, min_deal_size, 
+             min_deal_size_unit, max_deal_size, max_deal_size_unit, min_size_increment,
+             min_size_increment_unit, min_guaranteed_stop_distance, 
+             min_guaranteed_stop_distance_unit, min_stop_or_profit_distance,
+             min_stop_or_profit_distance_unit, max_stop_or_profit_distance,
+             max_stop_or_profit_distance_unit, decimal_places, margin_factor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(epic) DO UPDATE SET
+                min_step_distance=excluded.min_step_distance,
+                min_step_distance_unit=excluded.min_step_distance_unit,
+                min_deal_size=excluded.min_deal_size,
+                min_deal_size_unit=excluded.min_deal_size_unit,
+                max_deal_size=excluded.max_deal_size,
+                max_deal_size_unit=excluded.max_deal_size_unit,
+                min_size_increment=excluded.min_size_increment,
+                min_size_increment_unit=excluded.min_size_increment_unit,
+                min_guaranteed_stop_distance=excluded.min_guaranteed_stop_distance,
+                min_guaranteed_stop_distance_unit=excluded.min_guaranteed_stop_distance_unit,
+                min_stop_or_profit_distance=excluded.min_stop_or_profit_distance,
+                min_stop_or_profit_distance_unit=excluded.min_stop_or_profit_distance_unit,
+                max_stop_or_profit_distance=excluded.max_stop_or_profit_distance,
+                max_stop_or_profit_distance_unit=excluded.max_stop_or_profit_distance_unit,
+                decimal_places=excluded.decimal_places,
+                margin_factor=excluded.margin_factor,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                capital_market_details.epic,
+                capital_market_details.min_step_distance,
+                capital_market_details.min_step_distance_unit,
+                capital_market_details.min_deal_size,
+                capital_market_details.min_deal_size_unit,
+                capital_market_details.max_deal_size,
+                capital_market_details.max_deal_size_unit,
+                capital_market_details.min_size_increment,
+                capital_market_details.min_size_increment_unit,
+                capital_market_details.min_guaranteed_stop_distance,
+                capital_market_details.min_guaranteed_stop_distance_unit,
+                capital_market_details.min_stop_or_profit_distance,
+                capital_market_details.min_stop_or_profit_distance_unit,
+                capital_market_details.max_stop_or_profit_distance,
+                capital_market_details.max_stop_or_profit_distance_unit,
+                capital_market_details.decimal_places,
+                capital_market_details.margin_factor
+            )
+        )
+
+        return capital_market_details

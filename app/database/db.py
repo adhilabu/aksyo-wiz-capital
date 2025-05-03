@@ -7,7 +7,7 @@ import os
 
 import pandas as pd
 
-from app.analyse.schemas import IndicatorValues
+from app.analyse.schemas import CapitalMarketDetails, IndicatorValues
 from app.capital.schemas import CapitalTransactionType
 
 DATABASE_URL = os.getenv('DATABASE_URL', '')
@@ -132,10 +132,10 @@ class DBConnection:
         if metadata_json is None:
             metadata_json = {}
 
-        stock = stock_data[	'stock	']
+        stock = stock_data['stock']
         stock_name = stock_name or stock
-        ltp = stock_ltp or stock_data[	'ltp	']
-        timestamp = stock_data[	'timestamp	']
+        ltp = stock_ltp or stock_data['ltp']
+        timestamp = stock_data['timestamp']
         query = """
         INSERT INTO order_details (stock, ltp, sl, pl, cp, broke_resistance_level, rsi, adx, mfi, timestamp, entry_price, trade_type, stock_name, metadata_json, qty, order_status, order_ids, deal_id, deal_reference) # Added deal_id, deal_reference
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $2, $11, $12, $13, $14, $15, $16, $17, $18) # Added $17, $18
@@ -470,3 +470,38 @@ class DBConnection:
         """
         data = await self.fetch(query, self.end_date)
         return len(data) >= count
+
+    async def get_capital_market_details(self, epic: str) -> Optional[CapitalMarketDetails]:
+        """Retrieve market details from the database"""
+
+        query = """
+            SELECT epic, min_step_distance, min_step_distance_unit, min_deal_size, min_deal_size_unit, max_deal_size, max_deal_size_unit,
+                     min_size_increment, min_size_increment_unit, min_guaranteed_stop_distance, min_guaranteed_stop_distance_unit,
+                     min_stop_or_profit_distance, min_stop_or_profit_distance_unit, max_stop_or_profit_distance, max_stop_or_profit_distance_unit,
+                     decimal_places, margin_factor
+            FROM capital_market_details
+            WHERE epic = $1
+        """ 
+
+        data = await self.fetch(query, epic)
+        if data:
+            CapitalMarketDetails(
+                epic=data[0]['epic'],
+                min_step_distance=data[0]['min_step_distance'],
+                min_step_distance_unit=data[0]['min_step_distance_unit'],
+                min_deal_size=data[0]['min_deal_size'],
+                min_deal_size_unit=data[0]['min_deal_size_unit'],
+                max_deal_size=data[0]['max_deal_size'],
+                max_deal_size_unit=data[0]['max_deal_size_unit'],
+                min_size_increment=data[0]['min_size_increment'],
+                min_size_increment_unit=data[0]['min_size_increment_unit'],
+                min_guaranteed_stop_distance=data[0]['min_guaranteed_stop_distance'],
+                min_guaranteed_stop_distance_unit=data[0]['min_guaranteed_stop_distance_unit'],
+                min_stop_or_profit_distance=data[0]['min_stop_or_profit_distance'],
+                min_stop_or_profit_distance_unit=data[0]['min_stop_or_profit_distance_unit'],
+                max_stop_or_profit_distance=data[0]['max_stop_or_profit_distance'],
+                max_stop_or_profit_distance_unit=data[0]['max_stop_or_profit_distance_unit'],
+                decimal_places=data[0]['decimal_places'],
+                margin_factor=data[0]['margin_factor']
+            )
+        return None

@@ -131,3 +131,42 @@ CREATE INDEX idx_stock_start_date_end_date ON support_resistance_levels (stock, 
 ALTER TABLE order_details ADD COLUMN qty int default 0;
 ALTER TABLE order_details ADD COLUMN order_ids JSONB NOT NULL DEFAULT '[]';
 ALTER TABLE order_details ADD COLUMN order_status BOOLEAN DEFAULT FALSE;
+ALTER TABLE historical_data ADD CONSTRAINT unique_stock_timestamp UNIQUE (stock, timestamp);
+
+CREATE TABLE capital_market_details (
+  epic VARCHAR(255) PRIMARY KEY,
+  min_step_distance FLOAT,
+  min_step_distance_unit VARCHAR(50),
+  min_deal_size FLOAT,
+  min_deal_size_unit VARCHAR(50),
+  max_deal_size FLOAT,
+  max_deal_size_unit VARCHAR(50),
+  min_size_increment FLOAT,
+  min_size_increment_unit VARCHAR(50),
+  min_guaranteed_stop_distance FLOAT,
+  min_guaranteed_stop_distance_unit VARCHAR(50),
+  min_stop_or_profit_distance FLOAT,
+  min_stop_or_profit_distance_unit VARCHAR(50),
+  max_stop_or_profit_distance FLOAT,
+  max_stop_or_profit_distance_unit VARCHAR(50),
+  decimal_places INT,
+  margin_factor FLOAT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+   NEW.updated_at = NOW();
+   RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_capital_market_details_updated_at
+BEFORE UPDATE ON capital_market_details
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+ALTER TABLE capital_market_details ADD CONSTRAINT unique_epic UNIQUE (epic);

@@ -21,7 +21,7 @@ class PulsarProducer:
             f"non-persistent://public/default/{self.topic}", 
             send_timeout_millis=2000,  # Message timeout of 5 seconds
             batching_enabled=True,
-            batching_max_publish_delay_ms=10
+            batching_max_publish_delay_ms=2
         )
         print(f"Pulsar Producer connected to non-persistent topic: {self.topic}")
 

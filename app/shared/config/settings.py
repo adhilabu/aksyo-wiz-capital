@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     CAPITAL_API_PASSWORD: Optional[str] = None
     CAPITAL_API_BASE_URL: str = "https://demo-api-capital.backend-capital.com"
     CAPITAL_API_STREAMING_URL: str = "wss://api-streaming-capital.backend-capital.com/connect"
+    ENABLE_CAPITAL_CALL: bool = False
     
     # Database settings
     DATABASE_URL: str = "postgresql://postgres:postgres@db:5432/algo_trading"
@@ -37,16 +38,6 @@ class Settings(BaseSettings):
     
     # UI_INSTRUMENTS_LIST: List[str] = Field(default_factory=lambda: ["ETHUSD,EURUSD","USDJPY","J225","US30","BTCUSD"])
     UI_INSTRUMENTS: str = "OIL_CRUDE,US100,GOLD,J225,US30,BTCUSD"
-
-
-    # @model_validator(mode="before")
-    # def _split_instruments(cls, values: dict) -> dict:
-    #     raw = values.get("INSTRUMENTS", "")
-    #     values["INSTRUMENTS"] = [
-    #         item.strip() for item in raw.split(",") if item.strip()
-    #     ]
-    #     return values
-    
 
     class Config:
         env_file = ".env"

@@ -15,16 +15,28 @@ from app.capital.instruments import get_capital_epics, get_epics_for_strategy # 
 # This replaces the old WS_FEED_TYPE logic
 STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "DEFAULT") # Example: Use STRATEGY_TYPE instead of WS_FEED_TYPE
 
-async def process_websocket_message(message: str, producer: PulsarProducer):
+async def process_websocket_message(message: str, producer: PulsarProducer, websocket: websockets.WebSocketClientProtocol):
     """Processes a raw message from the WebSocket and sends it to Pulsar."""
     try:
         data_dict = json.loads(message)
-        if data_dict.get("destination") == "destination": # Check actual destination/type field
+        if data_dict.get("destination") == "ohlc.event":
             payload = data_dict.get("payload", {})            
             producer.send_message(json.dumps(payload))
 
         elif data_dict.get("destination") == "ping":
-            pass
+            payload = data_dict.get("payload", {})
+            timestamp = payload.get("timestamp")
+            if timestamp is not None:
+                pong_response = {
+                    "destination": "pong",
+                    "payload": {
+                        "timestamp": timestamp
+                    }
+                }
+                await websocket.send(json.dumps(pong_response))
+                print(f"Sent pong response for timestamp {timestamp}")
+            else:
+                print("Received ping message without timestamp")
 
         else:
             print(f"Received unexpected message: {data_dict}")
@@ -40,7 +52,7 @@ async def capital_websocket_listener(producer: PulsarProducer):
     api_client = CapitalComAPI() # Initialize client to handle session
     websocket = None
 
-    while True: # Keep trying to connect
+    while True:
         try:
             print("Attempting to connect to Capital.com WebSocket...")
             # Ensure session is valid before connecting
@@ -52,7 +64,7 @@ async def capital_websocket_listener(producer: PulsarProducer):
             epics_to_subscribe = get_capital_epics()
             
             if not epics_to_subscribe:
-                print(f"No EPICs found for strategy type 	'{STRATEGY_TYPE}	'. Waiting...")
+                print(f"No EPICs found for strategy type '{STRATEGY_TYPE} '. Waiting...")
                 await asyncio.sleep(60)
                 continue
 
@@ -87,7 +99,7 @@ async def capital_websocket_listener(producer: PulsarProducer):
             # Start listening for messages
             while True:
                 message = await websocket.recv()
-                await process_websocket_message(message, producer)
+                await process_websocket_message(message, producer, websocket)  # Pass websocket to handler
 
         except websockets.exceptions.ConnectionClosedError as e:
             print(f"WebSocket connection closed unexpectedly: {e}. Reconnecting in 10 seconds...")
