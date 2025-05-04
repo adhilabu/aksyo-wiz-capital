@@ -9,7 +9,9 @@ load_dotenv(dotenv_path=".env")
 class Settings(BaseSettings):
     # Environment settings
     ENVIRONMENT: str = "development"  # development, sandbox, production
-    
+    TELEGRAM_CHAT_ID: Optional[str] = None
+    TELEGRAM_TOKEN: Optional[str] = None
+    TELEGRAM_NOTIFICATION: bool = False
     # Capital.com API settings
     CAPITAL_API_KEY: Optional[str] = None
     CAPITAL_API_IDENTIFIER: Optional[str] = None

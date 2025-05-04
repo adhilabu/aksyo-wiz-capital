@@ -131,7 +131,7 @@ class CapitalAPI:
     async def get_current_trading_day_data(self, epic: str, interval: str = '1minute') -> pd.DataFrame:
         """Fetch intraday data for the current day."""
         end_dt_str = datetime.now(pytz.UTC).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
-        start_dt_str = (datetime.now(pytz.UTC) - pd.Timedelta(minutes=900)).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
+        start_dt_str = (datetime.now(pytz.UTC) - pd.Timedelta(minutes=999)).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
         logger.info(f"Fetching current trading day data for {epic} ({end_dt_str}) - ({start_dt_str}) with interval {interval}")
         return await self.get_recent_data(epic, start_dt_str, end_dt_str, interval)
 
@@ -141,13 +141,16 @@ class CapitalAPI:
             "epic": basic_order.epic,
             "direction": basic_order.transaction_type.value, # BUY/SELL
             "size": basic_order.quantity,
-            "guaranteedStop": False, # Default, can be made configurable
-            "forceOpen": True # Ensures it opens a new position
+            "guaranteedStop": True, # Set to True if guaranteed stop is needed
         }
         if basic_order.stop_distance:
             payload["stopDistance"] = basic_order.stop_distance
         if basic_order.profit_distance:
             payload["profitDistance"] = basic_order.profit_distance
+        # if basic_order.stop_loss:
+        #     payload["stopLevel"] = basic_order.stop_loss
+        # if basic_order.profit_level:
+        #     payload["profitLevel"] = basic_order.profit_level
         # Add trailingStop, stopDistance if needed
         return payload
 
@@ -159,13 +162,16 @@ class CapitalAPI:
             "size": basic_order.quantity,
             "level": basic_order.price, # The price for LIMIT/STOP
             "type": basic_order.order_type.value,
-            "goodTillDate": None,
             "guaranteedStop": True,
         }
-        if basic_order.stop_loss:
-            payload["stopLevel"] = basic_order.stop_loss
-        if basic_order.profit_level:
-            payload["profitLevel"] = basic_order.profit_level
+        if basic_order.stop_distance:
+            payload["stopDistance"] = basic_order.stop_distance
+        if basic_order.profit_distance:
+            payload["profitDistance"] = basic_order.profit_distance
+        # if basic_order.stop_loss:
+        #     payload["stopLevel"] = basic_order.stop_loss
+        # if basic_order.profit_level:
+        #     payload["profitLevel"] = basic_order.profit_level
         return payload
 
     async def place_order(self, basic_order: BasicPlaceOrderCapital) -> Optional[str]:

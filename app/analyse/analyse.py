@@ -1,6 +1,6 @@
 import asyncio
 from datetime import date, datetime, time, timedelta
-from decimal import ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 import json
 import os
 from typing import Any, Optional
@@ -37,7 +37,7 @@ SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 
 class StockIndicatorCalculator:
     TICK_SIZE = 0.01
-    TRADE_PERC = 0.003
+    TRADE_PERC = 0.005
     MAX_ADJUSTMENTS = 3
     TOTAL_TRADES_LIMIT = 10
     OPEN_TRADES_LIMIT = 5
@@ -135,6 +135,7 @@ class StockIndicatorCalculator:
     
     async def process_combined_stock_data(self):
         for stock in self.epics:
+            # await self.db_con.delete_historical_data(stock)
             current_day_data = await self.capital_client.get_current_trading_day_data(stock)
             await self.calculate_pivot_data(current_day_data)
             await self.db_con.save_data_to_db(current_day_data)
@@ -674,128 +675,279 @@ class StockIndicatorCalculator:
         # Fetch from API if not found in DB
         return await self.capital_client.get_instrument_details(epic)
 
-    async def calculate_sl_for_breakout(self, direction: CapitalTransactionType, entry_price: float, epic: str, details: CapitalMarketDetails) -> float:        
-        # Calculate step size in points
-        min_step = details.min_step_distance
+    def round_to_increment(self, value: float, increment: float, round_up: bool = None) -> float:
+        """Rounds a value up or down to the nearest multiple of the increment."""
+        if increment <= 0:
+            return value
+        decimal_value = Decimal(str(value))
+        decimal_increment = Decimal(str(increment))
+        rounding_mode = ROUND_UP if round_up else ROUND_DOWN
+        if round_up is None:
+            rounding_mode = ROUND_HALF_UP
+        rounded = (decimal_value / decimal_increment).quantize(Decimal('1.'), rounding=rounding_mode) * decimal_increment
+        return float(rounded)
+    
+    async def calculate_rounded_value_with_step(self, value: float, details: CapitalMarketDetails) -> float:
+        """Rounds a value (like distance or potential order price) to the nearest valid step."""
+        # Calculate step size based on min_step_distance and unit
+        step = details.min_step_distance
         if details.min_step_distance_unit == 'PERCENTAGE':
-            step = entry_price * (min_step / 100)
-        else:
-            step = min_step
-        
-        sl_percent = self.TRADE_PERC  # e.g., 0.8%
+            # Step as a percentage needs a base value. Using the input value itself.
+            # This is suitable for rounding distances.
+            step = value * (details.min_step_distance / 100)
+            # Ensure step is positive
+            if step <= 0:
+                 # Fallback to the raw point value if percentage calculation is zero or negative
+                 step = details.min_step_distance
+
+        return self.round_to_increment(value, step)
+
+    async def calculate_sl_for_breakout(
+        self,
+        direction: CapitalTransactionType,
+        entry_price: float,
+        details: CapitalMarketDetails, # Added details argument
+        stock_data: pd.DataFrame
+    ) -> float:
+        """Calculates Stop Loss price based on strategy and market rules."""
+        # Calculate step size for rounding final SL price
+        # Using entry_price to calculate percentage step if applicable
+        step = details.min_step_distance
+        if details.min_step_distance_unit == 'PERCENTAGE':
+            # Note: The step size as a percentage depends on the value it's applied to.
+            # Here we calculate it based on the entry price for consistency before rounding the final price.
+            step = entry_price * (details.min_step_distance / 100)
+            # Ensure step is positive
+            if step <= 0:
+                 # Fallback to the raw point value if percentage calculation is zero or negative
+                 step = details.min_step_distance
+
+
+        # Calculate min/max allowed distance in absolute terms based on entry price
+        # min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
+        min_distance = max(entry_price * (details.min_stop_or_profit_distance / 100), entry_price * (details.min_guaranteed_stop_distance / 100) if details.min_guaranteed_stop_distance_unit == 'PERCENTAGE' else details.min_guaranteed_stop_distance)
+        max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+
+        # --- Strategy Specific Logic ---
+        # Calculate desired SL based on initial percentage (e.g., 2%)
+        sl_percent = self.TRADE_PERC # Assume self.TRADE_PERC is defined (e.g., 0.02 for 2%)
         if direction == CapitalTransactionType.BUY:
             desired_sl = entry_price * (1 - sl_percent)
-            min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
-            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
-            current_distance = entry_price - desired_sl
-        else:
+        else: # CapitalTransactionType.SELL
             desired_sl = entry_price * (1 + sl_percent)
-            min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
-            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
-            current_distance = desired_sl - entry_price
-        
-        # Apply min/max constraints
-        if current_distance < min_distance:
-            desired_sl = entry_price - min_distance if direction == CapitalTransactionType.BUY else entry_price + min_distance
-        elif current_distance > max_distance:
-            desired_sl = entry_price - max_distance if direction == CapitalTransactionType.BUY else entry_price + max_distance
-        
-        # Round to nearest step
-        return round(desired_sl / step) * step if step != 0 else desired_sl
 
-    async def calculate_pl_for_breakout(self, direction: CapitalTransactionType, entry_price: float, epic: str, details: CapitalMarketDetails) -> float:        
-        # Calculate step size
-        min_step = details.min_step_distance
+        # Search for reversal candle and potentially use its low/high for SL
+        reversal_price = None
+        # Iterate backwards from the second to last candle (assuming last is current/entry)
+        # for i in reversed(range(1, len(stock_data))):
+        #      if i < 1: # Need at least one previous candle to check for reversal pattern
+        #          break
+        #      candle = stock_data.iloc[i]
+        #      prev_candle = stock_data.iloc[i - 1]
+
+        #      # Basic reversal logic: check if the previous candle was opposite direction
+        #      is_bearish_prev = prev_candle['close'] < prev_candle['open']
+        #      is_bullish_prev = prev_candle['close'] > prev_candle['open']
+        #      is_current_bearish = candle['close'] < candle['open']
+        #      is_current_bullish = candle['close'] > candle['open']
+
+
+        #      if direction == CapitalTransactionType.BUY and is_bullish_prev and is_current_bearish:
+        #          # Potential bearish reversal (peak), low of the previous candle might be support
+        #          reversal_price = prev_candle['low']
+        #          break
+        #      elif direction == CapitalTransactionType.SELL and is_bearish_prev and is_current_bullish:
+        #          # Potential bullish reversal (trough), high of the previous candle might be resistance
+        #          reversal_price = prev_candle['high']
+        #          break
+
+        # If a reversal price was found, check if its distance is within allowed API range
+        if reversal_price is not None:
+             reversal_distance = abs(entry_price - reversal_price)
+             if min_distance <= reversal_distance <= max_distance:
+                 self.logger.info(f"Using reversal candle price {reversal_price:.4f} for SL, distance {reversal_distance:.4f} is within API limits.")
+                 desired_sl = reversal_price
+             else:
+                 self.logger.info(f"Reversal candle price {reversal_price:.4f} found, but distance {reversal_distance:.4f} is outside API limits ({min_distance:.4f}-{max_distance:.4f}). Sticking to percentage-based SL.")
+
+        # --- End Strategy Specific Logic ---
+
+
+        # --- Apply API Constraints ---
+        # Re-calculate current distance based on the potentially adjusted desired_sl
+        current_distance = abs(entry_price - desired_sl)
+
+        # Ensure the final SL distance is within the min/max allowed by the API
+        if current_distance < min_distance:
+            self.logger.warning(f"Calculated SL distance {current_distance:.4f} is below API minimum {min_distance:.4f}. Adjusting SL.")
+            if direction == CapitalTransactionType.BUY:
+                desired_sl = entry_price - min_distance
+            else: # SELL
+                desired_sl = entry_price + min_distance
+        elif current_distance > max_distance:
+            self.logger.warning(f"Calculated SL distance {current_distance:.4f} exceeds API maximum {max_distance:.4f}. Adjusting SL.")
+            if direction == CapitalTransactionType.BUY:
+                desired_sl = entry_price - max_distance
+            else: # SELL
+                desired_sl = entry_price + max_distance
+        # --- End Apply API Constraints ---
+        # check if the desired SL is greater than the min_guaranteed_stop_distance PERCENTAGE if not set it as the value
+        # if details.min_guaranteed_stop_distance > 0:
+        #     min_guaranteed_stop_distance = entry_price * (details.min_guaranteed_stop_distance / 100) if details.min_guaranteed_stop_distance_unit == 'PERCENTAGE' else details.min_guaranteed_stop_distance
+        #     if current_distance < min_guaranteed_stop_distance:
+        #         desired_sl = entry_price - min_guaranteed_stop_distance if direction == CapitalTransactionType.BUY else entry_price + min_guaranteed_stop_distance
+
+
+        # Finally, round the desired SL price to the nearest valid step
+        round_dir = False if direction == CapitalTransactionType.BUY else True
+        final_sl = self.round_to_increment(desired_sl, step, round_up=round_dir)
+
+        self.logger.info(f"Calculated final SL price: {final_sl:.4f}")
+        return final_sl
+
+    async def calculate_pl_for_breakout(
+        self,
+        direction: CapitalTransactionType,
+        entry_price: float,
+        stop_loss: float, # The calculated and rounded stop loss price
+        details: CapitalMarketDetails # Added details argument
+    ) -> float:
+        """Calculates Profit Level price based on SL and market rules (1:2 RR)."""
+        # Calculate step size for rounding final PL price
+        # Using entry_price to calculate percentage step if applicable
+        step = details.min_step_distance
         if details.min_step_distance_unit == 'PERCENTAGE':
-            step = entry_price * (min_step / 100)
-        else:
-            step = min_step
-        
-        # Strategy PL percentage (double SL)
-        pl_percent = self.TRADE_PERC * 2  # e.g., 1.6%
+            # Note: The step size as a percentage depends on the value it's applied to.
+            # Here we calculate it based on the entry price for consistency before rounding the final price.
+            step = entry_price * (details.min_step_distance / 100)
+            # Ensure step is positive
+            if step <= 0:
+                 # Fallback to the raw point value if percentage calculation is zero or negative
+                 step = details.min_step_distance
+
+        # Calculate min/max allowed distance in absolute terms based on entry price
+        min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
+        max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+
+        # --- Strategy Specific Logic ---
+        # Calculate risk (absolute distance between entry and calculated SL)
+        risk = abs(entry_price - stop_loss)
+
+        # Calculate desired reward based on Risk/Reward ratio (e.g., 1:2)
+        reward = 2 * risk # Assuming a 1:2 Risk-Reward ratio strategy
+
+        # Calculate desired PL price based on entry price and reward
         if direction == CapitalTransactionType.BUY:
-            desired_pl = entry_price * (1 + pl_percent)
-            min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
-            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
-            current_distance = desired_pl - entry_price
-        else:
-            desired_pl = entry_price * (1 - pl_percent)
-            min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
-            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
-            current_distance = entry_price - desired_pl
-        
-        # Apply constraints
-        if current_distance < min_distance:
-            desired_pl = entry_price + min_distance if direction == CapitalTransactionType.BUY else entry_price - min_distance
-        elif current_distance > max_distance:
-            desired_pl = entry_price + max_distance if direction == CapitalTransactionType.BUY else entry_price - max_distance
-        
-        return round(desired_pl / step) * step if step != 0 else desired_pl
-    
-    async def calculate_rounded_value_with_step(self, value: float, details: CapitalMarketDetails) -> float:        
-        # Calculate step size
-        min_step = details.min_step_distance
-        if details.min_step_distance_unit == 'PERCENTAGE':
-            step = value * (min_step / 100)
-        else:
-            step = min_step
-            
-        return round(value / step) * step if step != 0 else value
+            desired_pl = entry_price + reward
+        else: # CapitalTransactionType.SELL
+            desired_pl = entry_price - reward
+        # --- End Strategy Specific Logic ---
 
-    async def get_base_payload_for_capital_order(self, epic: str, stock_ltp: float, 
-                                            trans_type: CapitalTransactionType = CapitalTransactionType.BUY, 
-                                            order_type: CapitalOrderType = CapitalOrderType.MARKET, timestamp = None) -> Optional[BasicPlaceOrderCapital]:
+        # --- Apply API Constraints ---
+        # Re-calculate current distance based on the potentially adjusted desired_pl
+        current_distance = abs(entry_price - desired_pl)
+
+        # Ensure the final PL distance is within the min/max allowed by the API
+        if current_distance < min_distance:
+            self.logger.warning(f"Calculated PL distance {current_distance:.4f} is below API minimum {min_distance:.4f}. Adjusting PL.")
+            if direction == CapitalTransactionType.BUY:
+                desired_pl = entry_price + min_distance
+            else: # SELL
+                desired_pl = entry_price - min_distance
+        elif current_distance > max_distance:
+            self.logger.warning(f"Calculated PL distance {current_distance:.4f} exceeds API maximum {max_distance:.4f}. Adjusting PL.")
+            if direction == CapitalTransactionType.BUY:
+                desired_pl = entry_price + max_distance
+            else: # SELL
+                desired_pl = entry_price - max_distance
+        # --- End Apply API Constraints ---
+
+
+        # Finally, round the desired PL price to the nearest valid step
+        round_dir = True if direction == CapitalTransactionType.BUY else False
+        final_pl = self.round_to_increment(desired_pl, step, round_up=round_dir)
+
+        self.logger.info(f"Calculated final PL price: {final_pl:.4f}")
+        return final_pl
+
+
+    async def get_base_payload_for_capital_order(self, epic: str, stock_ltp: float,
+                                                 trans_type: CapitalTransactionType = CapitalTransactionType.BUY,
+                                                 order_type: CapitalOrderType = CapitalOrderType.MARKET, timestamp = None, stock_data: pd.DataFrame = None) -> Optional[BasicPlaceOrderCapital]:
+        if stock_data is None or stock_data.empty:
+            self.logger.warning(f"Stock data is empty for {epic}")
+            return None
+
         if stock_ltp <= 0:
             self.logger.warning(f"Invalid LTP {stock_ltp} for {epic}")
             return None
-        
+
         # Fetch instrument details to ensure rules are loaded
         market_details = await self.ensure_market_details(epic, timestamp)
-        
+        if not market_details:
+             self.logger.error(f"Failed to retrieve market details for {epic}")
+             return None
+
+
         # Calculate dynamic SL/PL
-        stop_loss = await self.calculate_sl_for_breakout(trans_type, stock_ltp, epic, market_details)
-        profit_level = await self.calculate_pl_for_breakout(trans_type, stock_ltp, epic, market_details)
-        
+        # Pass market_details to SL/PL calculations
+        stop_loss = await self.calculate_sl_for_breakout(trans_type, stock_ltp, market_details, stock_data)
+        profit_level = await self.calculate_pl_for_breakout(trans_type, stock_ltp, stop_loss, market_details)
+
         # Quantity calculation
-        quantity = float(self.stock_per_price_limit / stock_ltp)
-        
+        # Calculate initial desired quantity based on capital allocation
+        initial_quantity = float(self.stock_per_price_limit / stock_ltp)
 
-        def round_to_increment(quantity, increment):
-            quantity = Decimal(str(quantity))
-            increment = Decimal(str(increment))
-            rounded = (quantity / increment).quantize(Decimal('1'), rounding=ROUND_UP) * increment
-            return float(rounded)
+        # Apply min/max constraints and round to the nearest valid increment
+        quantity = initial_quantity
 
-        # Validate quantity against market rules
-        if market_details:
-            if quantity < market_details.min_deal_size:
-                self.logger.warning(f"Calculated quantity {quantity} is below minimum deal size {market_details.min_deal_size} for {epic}.")
-                quantity = float(market_details.min_deal_size)
-            elif quantity > market_details.max_deal_size:
-                self.logger.warning(f"Calculated quantity {quantity} exceeds maximum deal size {market_details.max_deal_size} for {epic}.")
-                quantity = float(market_details.max_deal_size)
-            
-            # Round to the nearest valid increment
-            quantity = round_to_increment(quantity, market_details.min_deal_size)
-        
+        # 1. Enforce min and max deal size
+        if quantity < market_details.min_deal_size:
+             self.logger.info(f"Calculated quantity {quantity:.4f} is below minimum deal size {market_details.min_deal_size} for {epic}. Setting to minimum.")
+             quantity = float(market_details.min_deal_size)
+        elif quantity > market_details.max_deal_size:
+             self.logger.warning(f"Calculated quantity {quantity:.4f} exceeds maximum deal size {market_details.max_deal_size} for {epic}. Setting to maximum.")
+             quantity = float(market_details.max_deal_size)
+
+        # 2. Round the adjusted quantity to the nearest multiple of the minimum size increment
+        # Use the helper function with min_size_increment
+        quantity = self.round_to_increment(quantity, market_details.min_size_increment)
+
+
         if quantity <= 0:
             self.logger.warning(f"Calculated quantity is zero or negative for {epic} at LTP {stock_ltp}. Skipping order.")
             return None
-        
-        order_price = await self.calculate_rounded_value_with_step(stock_ltp, market_details)
+
+        # Calculate distances for the payload - these also need to be rounded to the step distance
         stop_distance = await self.calculate_rounded_value_with_step(abs(stock_ltp - stop_loss), market_details)
         profit_distance = await self.calculate_rounded_value_with_step(abs(stock_ltp - profit_level), market_details)
 
+        # Determine order price - only needed for LIMIT or STOP orders
+        order_price = None
+        if order_type in [CapitalOrderType.LIMIT, CapitalOrderType.STOP]:
+            # For limit/stop orders, the specific price needs to be set and rounded to the step distance
+            # If order type is LIMIT/STOP, stock_ltp might not be the intended order price.
+            # Assuming for this code, order_price is also based on LTP for simplicity or calculated elsewhere
+            # but needs rounding. If it's a different price (e.g., breakout level), use that price here.
+            # For robustness, you might pass the *intended* order price to this function.
+            # Using stock_ltp and rounding it as a placeholder:
+             order_price = await self.calculate_rounded_value_with_step(stock_ltp, market_details)
+             # Note: In a real scenario, the 'price' for a limit/stop order should be the *target* price
+             # which would be determined by your strategy, not necessarily the LTP.
+             # This code uses LTP as the 'order_price' placeholder if order_type is not MARKET.
+             # You should replace stock_ltp here with the actual limit/stop price from your strategy.
+
+
         return BasicPlaceOrderCapital(
             quantity=quantity,
-            price=order_price if order_type in [CapitalOrderType.LIMIT, CapitalOrderType.STOP] else None,
+            price=order_price, # This will be None for MARKET orders
             epic=epic,
             order_type=order_type,
             transaction_type=trans_type,
-            stop_loss=stop_loss,
-            profit_level=profit_level,
-            stop_distance=stop_distance,
-            profit_distance=profit_distance,
+            stop_loss=stop_loss, # The calculated and rounded stop price
+            profit_level=profit_level, # The calculated and rounded profit price
+            stop_distance=stop_distance, # The rounded distance from entry price to SL price
+            profit_distance=profit_distance, # The rounded distance from entry price to PL price
         )
 
     async def calculate_atr(self, stock_data_5_min, period=14):
@@ -956,15 +1108,13 @@ class StockIndicatorCalculator:
         stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=5), self.end_date)
         if stock_data.empty:
             return
-
+        
+        #  order by timestamp
+        stock_data = stock_data.sort_values(by='timestamp', ascending=True)
         final_stock_data = stock_data.iloc[-1]
         current_timestamp = stock_data.iloc[-1]['timestamp']
         # Existing checks remain unchanged
-        await self.update_open_trades_status(stock, current_timestamp)
-        if stock in self.executed_breakouts and self.executed_breakouts[stock]:
-            self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
-            return
-        
+        await self.update_open_trades_status(stock, current_timestamp)        
         results = await self.db_con.get_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT, total_count=self.TOTAL_TRADES_LIMIT)
         if any(results):
             self.logger.info(f"SMA: {stock}: Condition met, skipping trade")
@@ -973,15 +1123,22 @@ class StockIndicatorCalculator:
         current_price = final_stock_data['ltp']
         breakout_direction = None
 
+        if stock_data.empty or len(stock_data) < 200:
+            self.logger.info(f"SMA: {stock}: Insufficient data to calculate SMAs. Skipping.")
+            return
+
         # Calculate 13-period and 200-period SMAs using closing prices
-        stock_data['sma13'] = stock_data['close'].rolling(window=13).mean()
-        stock_data['sma200'] = stock_data['close'].rolling(window=200).mean()
-        
+        # Calculate SMA with partial window initialization
+        stock_data['sma13'] = stock_data['close'].rolling(window=13, min_periods=1).mean()
+        stock_data['sma200'] = stock_data['close'].rolling(window=200, min_periods=1).mean()
+
         # Extract latest SMA values and closing price
         sma13 = stock_data['sma13'].iloc[-1]
         sma200 = stock_data['sma200'].iloc[-1]
         latest_close = final_stock_data['close']
-        prev_close = stock_data['close'].iloc[-2]
+        prev_sma13 = stock_data['sma13'].iloc[-2]
+        prev_high = stock_data['high'].iloc[-2]
+        prev_low = stock_data['low'].iloc[-2]
         
         # Check if SMAs are valid (not NaN)
         if pd.isna(sma13) or pd.isna(sma200):
@@ -991,9 +1148,9 @@ class StockIndicatorCalculator:
         breakout_direction = CapitalTransactionType.BUY
         broken_level = sma13  # Using 200 SMA as confirmation level
 
-        if latest_close > sma13 and latest_close > sma200 and prev_close < sma13:
+        if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13:
             breakout_direction = CapitalTransactionType.BUY
-        elif latest_close < sma13 and latest_close < sma200 and prev_close > sma13:
+        elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13:
             breakout_direction = CapitalTransactionType.SELL
         else:
             self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
@@ -1013,7 +1170,8 @@ class StockIndicatorCalculator:
             stock_ltp=stock_ltp,
             trans_type=breakout_direction,
             order_type=order_type,
-            timestamp=current_timestamp
+            timestamp=current_timestamp,
+            stock_data=stock_data
         )
         
         if not base_payload:
@@ -1021,15 +1179,6 @@ class StockIndicatorCalculator:
         
         await asyncio.sleep(random.uniform(0, 1))
 
-        # Check open trade limits
-        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("SMA: Max open trades reached. Skipping.")
-            return
-
-        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
-            self.logger.info("SMA: Max loss trades reached. Skipping.")
-            return
-                
         # Redis key for stock timestamp validation
         stock_ts_key = f"order:{stock}:{current_timestamp}"
 
@@ -1039,6 +1188,15 @@ class StockIndicatorCalculator:
 
         # Set TTL for the stock timestamp key (100 seconds)
         self.redis_cache.client.expire(stock_ts_key, 30)
+
+        # Check open trade limits
+        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+            self.logger.info("SMA: Max open trades reached. Skipping.")
+            return
+
+        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+            self.logger.info("SMA: Max loss trades reached. Skipping.")
+            return
         
         # Calculate momentum indicators
         rsi, adx, mfi = await asyncio.gather(
@@ -1076,7 +1234,7 @@ class StockIndicatorCalculator:
             metadata_json,
             base_payload.quantity,
             order_status=True if self.test_mode else False,
-            order_ids=[deal_reference],
+            order_ids=[deal_reference] if deal_reference else [],
             stock_ltp=stock_ltp
         )
 

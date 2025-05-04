@@ -87,6 +87,13 @@ class DBConnection:
         """
         data = await self.fetch(query, stock, start_date, end_date)
         return json.loads(data[0]['pivot_data']) if data else {}
+    
+    async def delete_historical_data(self, stock: str):
+        query = """
+            DELETE FROM historical_data
+            WHERE stock = $1
+        """
+        await self.execute(query, stock)
 
     async def save_data_to_db(self, data: pd.DataFrame):
         if data.empty:
@@ -95,7 +102,7 @@ class DBConnection:
         # data = data.infer_objects(copy=False).fillna(0)
         with pd.option_context("future.no_silent_downcasting", True):
             data = data.fillna(0)
-        
+
         query = """
             INSERT INTO historical_data (stock, timestamp, open, high, low, close, volume, open_interest, ltp)
             SELECT x.stock, x.timestamp, x.open, x.high, x.low, x.close, x.volume, x.open_interest, x.ltp
@@ -213,7 +220,7 @@ class DBConnection:
         Fetch open orders for a stock on a specific date.
         """
         query = """
-        SELECT * FROM order_details WHERE stock = $1 AND status = 'OPEN' AND DATE(timestamp) = $2
+        SELECT * FROM order_details WHERE stock = $1 AND status = 'OPEN' AND DATE(timestamp) = $2 AND order_ids IS NOT NULL AND order_ids != '[]'
         """
         return await self.fetch(query, stock, trade_date)
 
@@ -344,9 +351,9 @@ class DBConnection:
     async def get_trade_stats(self, stock, open_count=2, total_count=4):
         query = """
         SELECT 
-            COUNT(*) FILTER (WHERE stock = $1 AND status = 'OPEN') > 0 as has_open_stock,
-            COUNT(*) FILTER (WHERE status = 'OPEN') as open_count,
-            COUNT(*) as total_count
+            COUNT(*) FILTER (WHERE stock = $1 AND status = 'OPEN' AND order_ids IS NOT NULL AND order_ids != '[]') > 0 as has_open_stock,
+            COUNT(*) FILTER (WHERE status = 'OPEN' AND order_ids IS NOT NULL AND order_ids != '[]') as open_count,
+            COUNT(*) FILTER (WHERE order_ids IS NOT NULL AND order_ids != '[]') as total_count
         FROM order_details
         WHERE DATE(timestamp) = $2
         """
