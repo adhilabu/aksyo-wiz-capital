@@ -14,6 +14,8 @@ logs/*
 notes.txt
 *.sh
 market_holidays_cache.json
+holiday.json
+holidays.py
 notes/*
 test_notes/*
 VWAP_Scalping_01.ipynb

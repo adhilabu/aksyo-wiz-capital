@@ -37,7 +37,7 @@ SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 
 class StockIndicatorCalculator:
     TICK_SIZE = 0.01
-    TRADE_PERC = 0.005
+    TRADE_PERC = 0.006
     MAX_ADJUSTMENTS = 3
     TOTAL_TRADES_LIMIT = 10
     OPEN_TRADES_LIMIT = 5
@@ -59,6 +59,7 @@ class StockIndicatorCalculator:
         self.stock_index_map = {}
         self.stock_name_map = {}
         self.stock_per_price_limit = float(STOCK_PER_PRICE_LIMIT)
+        self.market_details = None
 
     def set_and_get_dates(self, for_historical_data=False):
         self.db_con.end_date = self.end_date
@@ -76,9 +77,21 @@ class StockIndicatorCalculator:
         filename = f"{current_date}.txt"
         return f"{note_dir}/{filename}"
     
+    async def set_market_details_from_file(self, file_path: str = 'holiday.json') -> dict[str, dict[str, Any]]:
+        """Load market details from a JSON file"""
+        if not os.path.exists(file_path):
+            self.logger.error(f"Market details file {file_path} does not exist.")
+            return {}
+        
+        with open(file_path, 'r') as file:
+            market_details = json.load(file)
+        
+        self.market_details = market_details
+    
     async def initialize_historical_data(self):
         start_time = datetime.now()
-        await self.process_combined_stock_data()
+        await self.set_market_details_from_file()
+        await self.process_historical_combined_stock_data()
         end_time = datetime.now()
         self.logger.info(f"Data initialized in {end_time - start_time} seconds.")
 
@@ -132,13 +145,113 @@ class StockIndicatorCalculator:
         }).reset_index()
         data['stock'] = stock
         return data
+
+    def is_trading_day(self, date: datetime, market_config: dict) -> bool:
+        """Check if a date is a valid trading day"""
+        tz = pytz.timezone(market_config["timezone"])
+        local_date = date.astimezone(tz)
+        
+        # Check weekend trading
+        if not market_config["weekend_trading"] and local_date.weekday() >= 5:
+            return False
+            
+        # Check configured holidays
+        if local_date.strftime("%Y-%m-%d") in market_config.get("holidays", []):
+            return False
+            
+        # Add market-specific holiday checks here (e.g., using pandas_market_calendars)
+        # ...
+        
+        return True
     
-    async def process_combined_stock_data(self):
+    async def process_current_day_combined_stock_data(self):
         for stock in self.epics:
-            # await self.db_con.delete_historical_data(stock)
-            current_day_data = await self.capital_client.get_current_trading_day_data(stock)
-            await self.calculate_pivot_data(current_day_data)
-            await self.db_con.save_data_to_db(current_day_data)
+            market_config = self.market_details.get(stock, {})
+            current_date = datetime.now(pytz.UTC)
+            if self.is_trading_day(current_date, market_config):
+                self.logger.info(f"Processing current day data for {stock}.")
+                day_start, day_end = self.get_market_hours_utc(current_date, market_config)
+                current_day_end = current_date.replace(tzinfo=None) if day_end > current_day_end else day_end
+                batch_data = await self.capital_client.get_recent_data(
+                    epic=stock,
+                    start_dt_str=day_start.strftime('%Y-%m-%dT%H:%M:%S'),
+                    end_dt_str=current_day_end.strftime('%Y-%m-%dT%H:%M:%S'),
+                    interval='1minute'
+                )
+                if not batch_data.empty:
+                    # await self.calculate_pivot_data(batch_data)
+                    await self.db_con.save_data_to_db(batch_data)
+
+
+    async def process_historical_combined_stock_data(self):
+        for stock in self.epics:
+            market_config = self.market_details.get(stock, {})
+            
+            # Process last 10 trading days
+            days_checked = 0
+            current_date = datetime.now(pytz.UTC)               
+            
+            while days_checked < 10:
+                if not self.is_trading_day(current_date, market_config):
+                    continue
+                    
+                days_checked += 1
+                day_start, day_end = self.get_market_hours_utc(current_date, market_config)
+                current_date -= timedelta(days=1)
+                
+                if not day_start or not day_end:
+                    continue
+                    
+                daily_data = pd.DataFrame()
+                current_batch_start = day_start
+                
+                while current_batch_start < day_end:
+                    current_batch_end = min(
+                        current_batch_start + timedelta(minutes=999),
+                        day_end
+                    )
+                    
+                    # Format timestamps
+                    start_str = current_batch_start.strftime('%Y-%m-%dT%H:%M:%S')
+                    end_str = current_batch_end.strftime('%Y-%m-%dT%H:%M:%S')
+                    
+                    self.logger.info(f"Fetching {stock} data from {start_str} to {end_str}")
+                    batch_data = await self.capital_client.get_recent_data(
+                        epic=stock,
+                        start_dt_str=start_str,
+                        end_dt_str=end_str,
+                        interval='1minute'
+                    )
+                    
+                    if not batch_data.empty:
+                        daily_data = pd.concat([daily_data, batch_data])
+                    
+                    # Move to next batch (add 1 minute to avoid overlap)
+                    current_batch_start = current_batch_end + timedelta(minutes=1)
+            
+                if not daily_data.empty:
+                    await self.calculate_pivot_data(daily_data)
+                    await self.db_con.save_data_to_db(daily_data)
+
+    def get_market_hours_utc(self, date: datetime, market_config: dict):
+        """Get trading hours for a specific date"""
+        tz = pytz.timezone(market_config["timezone"])
+        open_time = datetime.strptime(market_config["open"], "%H:%M").time()
+        close_time = datetime.strptime(market_config["close"], "%H:%M").time()
+        
+        # Create market open/close datetime in local timezone
+        market_open = tz.localize(datetime.combine(date.date(), open_time))
+        market_close = tz.localize(datetime.combine(date.date(), close_time))
+        
+        # Handle overnight sessions
+        if close_time < open_time:
+            market_close += timedelta(days=1)
+            
+        # Convert to UTC
+        market_open_utc = market_open.astimezone(pytz.UTC).replace(tzinfo=None)
+        market_close_utc = market_close.astimezone(pytz.UTC).replace(tzinfo=None)
+        
+        return market_open_utc, market_close_utc
 
     async def calculate_mfi_talib(self, stock_data: pd.DataFrame, period=14) -> np.float64:
         if len(stock_data) <= 14:
@@ -780,22 +893,25 @@ class StockIndicatorCalculator:
         # Ensure the final SL distance is within the min/max allowed by the API
         if current_distance < min_distance:
             self.logger.warning(f"Calculated SL distance {current_distance:.4f} is below API minimum {min_distance:.4f}. Adjusting SL.")
+            app_min_distance = min_distance * 1.01
             if direction == CapitalTransactionType.BUY:
-                desired_sl = entry_price - min_distance
+                desired_sl = entry_price - app_min_distance
             else: # SELL
-                desired_sl = entry_price + min_distance
+                desired_sl = entry_price + app_min_distance
         elif current_distance > max_distance:
             self.logger.warning(f"Calculated SL distance {current_distance:.4f} exceeds API maximum {max_distance:.4f}. Adjusting SL.")
+            app_max_distance = max_distance * 0.99
             if direction == CapitalTransactionType.BUY:
-                desired_sl = entry_price - max_distance
+                desired_sl = entry_price - app_max_distance
             else: # SELL
-                desired_sl = entry_price + max_distance
+                desired_sl = entry_price + app_max_distance
+        
         # --- End Apply API Constraints ---
         # check if the desired SL is greater than the min_guaranteed_stop_distance PERCENTAGE if not set it as the value
-        # if details.min_guaranteed_stop_distance > 0:
-        #     min_guaranteed_stop_distance = entry_price * (details.min_guaranteed_stop_distance / 100) if details.min_guaranteed_stop_distance_unit == 'PERCENTAGE' else details.min_guaranteed_stop_distance
-        #     if current_distance < min_guaranteed_stop_distance:
-        #         desired_sl = entry_price - min_guaranteed_stop_distance if direction == CapitalTransactionType.BUY else entry_price + min_guaranteed_stop_distance
+        if details.min_guaranteed_stop_distance > 0:
+            min_guaranteed_stop_distance = entry_price * (details.min_guaranteed_stop_distance / 100) if details.min_guaranteed_stop_distance_unit == 'PERCENTAGE' else details.min_guaranteed_stop_distance
+            if current_distance < min_guaranteed_stop_distance:
+                desired_sl = entry_price - min_guaranteed_stop_distance if direction == CapitalTransactionType.BUY else entry_price + min_guaranteed_stop_distance
 
 
         # Finally, round the desired SL price to the nearest valid step
@@ -834,7 +950,7 @@ class StockIndicatorCalculator:
         risk = abs(entry_price - stop_loss)
 
         # Calculate desired reward based on Risk/Reward ratio (e.g., 1:2)
-        reward = 2 * risk # Assuming a 1:2 Risk-Reward ratio strategy
+        reward = 1 * risk # Assuming a 1:2 Risk-Reward ratio strategy
 
         # Calculate desired PL price based on entry price and reward
         if direction == CapitalTransactionType.BUY:
@@ -1105,7 +1221,7 @@ class StockIndicatorCalculator:
         self.logger.info(f"RH:  High-probability trade executed for {stock}: ")
 
     async def analyze_sma_strategy(self, stock) -> None:
-        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=5), self.end_date)
+        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=10), self.end_date)
         if stock_data.empty:
             return
         
@@ -1129,8 +1245,8 @@ class StockIndicatorCalculator:
 
         # Calculate 13-period and 200-period SMAs using closing prices
         # Calculate SMA with partial window initialization
-        stock_data['sma13'] = stock_data['close'].rolling(window=13, min_periods=1).mean()
-        stock_data['sma200'] = stock_data['close'].rolling(window=200, min_periods=1).mean()
+        stock_data['sma13'] = stock_data['close'].rolling(window=13).mean()
+        stock_data['sma200'] = stock_data['close'].rolling(window=200).mean()
 
         # Extract latest SMA values and closing price
         sma13 = stock_data['sma13'].iloc[-1]
