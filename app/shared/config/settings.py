@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     
     # Trading instruments
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    HISTORY_DATA_PERIOD: int = 10  # 10 DAYS
     
     # UI_INSTRUMENTS_LIST: List[str] = Field(default_factory=lambda: ["ETHUSD,EURUSD","USDJPY","J225","US30","BTCUSD"])
     UI_INSTRUMENTS: str = "OIL_CRUDE,US100,GOLD,J225,US30,BTCUSD"

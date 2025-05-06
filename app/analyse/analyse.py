@@ -37,7 +37,7 @@ SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 
 class StockIndicatorCalculator:
     TICK_SIZE = 0.01
-    TRADE_PERC = 0.006
+    TRADE_PERC = 0.005
     MAX_ADJUSTMENTS = 3
     TOTAL_TRADES_LIMIT = 10
     OPEN_TRADES_LIMIT = 5
@@ -92,6 +92,7 @@ class StockIndicatorCalculator:
         start_time = datetime.now()
         await self.set_market_details_from_file()
         await self.process_historical_combined_stock_data()
+        await self.process_current_day_combined_stock_data()
         end_time = datetime.now()
         self.logger.info(f"Data initialized in {end_time - start_time} seconds.")
 
@@ -170,14 +171,7 @@ class StockIndicatorCalculator:
             current_date = datetime.now(pytz.UTC)
             if self.is_trading_day(current_date, market_config):
                 self.logger.info(f"Processing current day data for {stock}.")
-                day_start, day_end = self.get_market_hours_utc(current_date, market_config)
-                current_day_end = current_date.replace(tzinfo=None) if day_end > current_day_end else day_end
-                batch_data = await self.capital_client.get_recent_data(
-                    epic=stock,
-                    start_dt_str=day_start.strftime('%Y-%m-%dT%H:%M:%S'),
-                    end_dt_str=current_day_end.strftime('%Y-%m-%dT%H:%M:%S'),
-                    interval='1minute'
-                )
+                batch_data = await self.capital_client.get_current_trading_day_data(stock)
                 if not batch_data.empty:
                     # await self.calculate_pivot_data(batch_data)
                     await self.db_con.save_data_to_db(batch_data)
@@ -191,13 +185,13 @@ class StockIndicatorCalculator:
             days_checked = 0
             current_date = datetime.now(pytz.UTC)               
             
-            while days_checked < 10:
+            while days_checked < HISTORY_DATA_PERIOD:
+                current_date -= timedelta(days=1)
                 if not self.is_trading_day(current_date, market_config):
                     continue
                     
                 days_checked += 1
                 day_start, day_end = self.get_market_hours_utc(current_date, market_config)
-                current_date -= timedelta(days=1)
                 
                 if not day_start or not day_end:
                     continue
@@ -1221,7 +1215,7 @@ class StockIndicatorCalculator:
         self.logger.info(f"RH:  High-probability trade executed for {stock}: ")
 
     async def analyze_sma_strategy(self, stock) -> None:
-        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=10), self.end_date)
+        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=HISTORY_DATA_PERIOD), self.end_date)
         if stock_data.empty:
             return
         
@@ -1245,8 +1239,8 @@ class StockIndicatorCalculator:
 
         # Calculate 13-period and 200-period SMAs using closing prices
         # Calculate SMA with partial window initialization
-        stock_data['sma13'] = stock_data['close'].rolling(window=13).mean()
-        stock_data['sma200'] = stock_data['close'].rolling(window=200).mean()
+        stock_data['sma13'] = stock_data['close'].rolling(window=13, min_periods=1).mean()
+        stock_data['sma200'] = stock_data['close'].rolling(window=200, min_periods=1).mean()
 
         # Extract latest SMA values and closing price
         sma13 = stock_data['sma13'].iloc[-1]

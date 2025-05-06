@@ -1,116 +1,161 @@
-# Placeholder for Capital.com WebSocket feed implementation
 import asyncio
 import json
 import os
 import ssl
 import uuid
 import websockets
-from app.redis.redis import RedisCache # Assuming RedisCache is still used
-from app.pulsar.producer import PulsarProducer # Assuming PulsarProducer is still used
+from app.redis.redis import RedisCache
+from app.pulsar.producer import PulsarProducer
 from app.capital.capital_com import CapitalComAPI
-from app.capital.instruments import get_capital_epics, get_epics_for_strategy # Use the new instrument function
-# from app.capital.schemas import CapitalWebSocketMessage # Import schema for parsing messages
+from app.capital.instruments import get_capital_epics, get_epics_for_strategy
 
-# Determine which set of EPICs to subscribe to based on environment variable or config
-# This replaces the old WS_FEED_TYPE logic
-STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "DEFAULT") # Example: Use STRATEGY_TYPE instead of WS_FEED_TYPE
+STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "DEFAULT")
+PING_INTERVAL = 15  # WebSocket-level ping interval in seconds
+RECONNECT_DELAY = 3  # Base delay for reconnection attempts in seconds
+
+class AuthenticationError(Exception):
+    """Custom exception for authentication failures"""
+    pass
 
 async def process_websocket_message(message: str, producer: PulsarProducer, websocket: websockets.WebSocketClientProtocol):
-    """Processes a raw message from the WebSocket and sends it to Pulsar."""
+    """Processes WebSocket messages and handles protocol-level keep-alives"""
     try:
         data_dict = json.loads(message)
+        
+        # Handle market data events
         if data_dict.get("destination") == "ohlc.event":
-            payload = data_dict.get("payload", {})            
-            producer.send_message(json.dumps(payload))
-
+            producer.send_message(json.dumps(data_dict.get("payload", {})))
+        
+        # Handle application-level ping-pong
         elif data_dict.get("destination") == "ping":
-            payload = data_dict.get("payload", {})
-            timestamp = payload.get("timestamp")
+            timestamp = data_dict.get("payload", {}).get("timestamp")
             if timestamp is not None:
-                pong_response = {
+                await websocket.send(json.dumps({
                     "destination": "pong",
-                    "payload": {
-                        "timestamp": timestamp
-                    }
-                }
-                await websocket.send(json.dumps(pong_response))
-                print(f"Sent pong response for timestamp {timestamp}")
-            else:
-                print("Received ping message without timestamp")
-
-        else:
-            print(f"Received unexpected message: {data_dict}")
-            pass
+                    "payload": {"timestamp": timestamp}
+                }))
+        
+        # Handle authentication errors
+        elif data_dict.get("status") == "error":
+            error_code = data_dict.get("errorCode", "").lower()
+            if "auth" in error_code or "token" in error_code:
+                raise AuthenticationError(f"Auth error: {data_dict.get('errorMessage')}")
             
+        return False
+    
     except json.JSONDecodeError:
-        print(f"Failed to decode JSON message: {message}")
+        print(f"Failed to decode JSON message: {message[:200]}")
+    except AuthenticationError as ae:
+        print(f"Authentication failure: {ae}")
+        await websocket.close()
+        return True
     except Exception as e:
-        print(f"Error processing WebSocket message: {e}")
+        print(f"Error processing message: {str(e)}")
+    
+    return False
+
+async def subscribe_to_epics(websocket, api_client, epics_to_subscribe):
+    """Handle batch subscription with error handling"""
+    batch_size = 50
+    for i in range(0, len(epics_to_subscribe), batch_size):
+        batch = epics_to_subscribe[i:i+batch_size]
+        sub_id = str(uuid.uuid4())
+        
+        subscription_message = {
+            "destination": "OHLCMarketData.subscribe",
+            "correlationId": sub_id,
+            "cst": api_client.cst,
+            "securityToken": api_client.security_token,
+            "payload": {
+                "epics": batch,
+                "resolutions": ["MINUTE"],
+                "type": "classic"
+            }
+        }
+        
+        try:
+            await websocket.send(json.dumps(subscription_message))
+            response = await asyncio.wait_for(websocket.recv(), timeout=10)
+            response_data = json.loads(response)
+            
+            if response_data.get("status") != "OK":
+                print(f"Subscription failed for batch {i//batch_size}: {response_data}")
+                if response_data.get("errorCode") == "AUTH_EXPIRED":
+                    raise AuthenticationError("Auth expired during subscription")
+        
+        except asyncio.TimeoutError:
+            print(f"Timeout waiting for subscription response (batch {i//batch_size})")
+        except AuthenticationError as ae:
+            print(f"Critical auth error during subscription: {ae}")
+            await websocket.close()
+            return False
+        except Exception as e:
+            print(f"Unexpected error during subscription: {str(e)}")
+    
+    return True
 
 async def capital_websocket_listener(producer: PulsarProducer):
-    """Connects to Capital.com WebSocket and listens for market data."""
-    api_client = CapitalComAPI() # Initialize client to handle session
-    websocket = None
+    """Robust WebSocket listener with enhanced reconnection logic"""
+    api_client = CapitalComAPI()
+    reconnect_attempts = 0
+    ssl_context = ssl.create_default_context()
 
     while True:
         try:
-            print("Attempting to connect to Capital.com WebSocket...")
-            # Ensure session is valid before connecting
+            # Establish valid session
             if not await api_client.ensure_session_valid():
-                print("Failed to establish API session. Retrying in 60 seconds...")
-                await asyncio.sleep(60)
+                print("Session validation failed")
+                await asyncio.sleep(RECONNECT_DELAY ** reconnect_attempts)
+                reconnect_attempts = min(reconnect_attempts + 1, 5)
                 continue
-            websocket = await websockets.connect(api_client.streaming_url)
+            
+            # Get current EPICs list
             epics_to_subscribe = get_capital_epics()
-            
             if not epics_to_subscribe:
-                print(f"No EPICs found for strategy type '{STRATEGY_TYPE} '. Waiting...")
+                print("No EPICs available for subscription")
                 await asyncio.sleep(60)
                 continue
 
-            # Subscribe to market data for the selected EPICs
-            # Capital.com might require subscribing in batches if the list is large
-            # Adjust batch size as needed
-            batch_size = 50 
-            for i in range(0, len(epics_to_subscribe), batch_size):
-                batch = epics_to_subscribe[i:i + batch_size]
-                subscription_message = {
-                    "destination": "OHLCMarketData.subscribe",
-                    "correlationId": str(uuid.uuid4()),
-                    "cst": api_client.cst, # Include tokens if required per message
-                    "securityToken": api_client.security_token,
-                    "payload": {
-                        "epics": batch,
-                        "resolutions": [
-                            "MINUTE"
-                        ],
-                        "type": "classic"
-                    }
-                }
-                await websocket.send(json.dumps(subscription_message))
-                sub_response = await websocket.recv() # Wait for confirmation
-                print(f"Subscription response for batch {i//batch_size + 1}: {sub_response}")
-                # Check response status
-                if json.loads(sub_response).get("status") != "OK":
-                    print(f"Warning: Subscription failed for batch {i//batch_size + 1}")
-            
-            print(f"Subscribed to {len(epics_to_subscribe)} EPICs.")
-
-            # Start listening for messages
-            while True:
-                message = await websocket.recv()
-                await process_websocket_message(message, producer, websocket)  # Pass websocket to handler
-
-        except websockets.exceptions.ConnectionClosedError as e:
-            print(f"WebSocket connection closed unexpectedly: {e}. Reconnecting in 10 seconds...")
-            websocket = None
-            await asyncio.sleep(10)
+            # Connect with keep-alive parameters
+            async with websockets.connect(
+                api_client.streaming_url,
+                ping_interval=PING_INTERVAL,
+                ping_timeout=PING_INTERVAL,
+                ssl=ssl_context
+            ) as websocket:
+                
+                print(f"Connected to WebSocket, subscribing to {len(epics_to_subscribe)} instruments")
+                reconnect_attempts = 0  # Reset on successful connection
+                
+                # Perform subscription
+                if not await subscribe_to_epics(websocket, api_client, epics_to_subscribe):
+                    continue  # Reconnect if subscription failed
+                
+                # Main message processing loop
+                while True:
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=PING_INTERVAL * 2)
+                        reconnect_needed = await process_websocket_message(message, producer, websocket)
+                        if reconnect_needed:
+                            break
+                    except asyncio.TimeoutError:
+                        # Send keep-alive
+                        await websocket.ping()
+                        print("Sent WebSocket-level ping")
+        
+        except AuthenticationError as ae:
+            print(f"Authentication failed: {ae}")
+            await api_client.reset_session()  # Force new session
+            await asyncio.sleep(RECONNECT_DELAY)
+        except (websockets.ConnectionClosed, ConnectionResetError) as e:
+            print(f"Connection closed: {str(e)}")
+            await asyncio.sleep(RECONNECT_DELAY ** reconnect_attempts)
+            reconnect_attempts = min(reconnect_attempts + 1, 5)
         except Exception as e:
-            print(f"An error occurred in WebSocket listener: {e}. Retrying in 30 seconds...")
-            if websocket:
-                try:
-                    await websocket.close()
-                except Exception:
-                    pass # Ignore errors during close
-            websocket = None
-            await asyncio.sleep(30)
+            print(f"Unexpected error: {str(e)}")
+            await asyncio.sleep(RECONNECT_DELAY ** reconnect_attempts)
+            reconnect_attempts = min(reconnect_attempts + 1, 5)
+
+# if __name__ == "__main__":
+#     producer = PulsarProducer()  # Initialize your Pulsar producer
+#     asyncio.run(capital_websocket_listener(producer))
