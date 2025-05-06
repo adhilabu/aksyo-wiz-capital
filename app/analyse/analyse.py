@@ -1249,6 +1249,12 @@ class StockIndicatorCalculator:
         prev_sma13 = stock_data['sma13'].iloc[-2]
         prev_high = stock_data['high'].iloc[-2]
         prev_low = stock_data['low'].iloc[-2]
+        prev_high_2 = stock_data['high'].iloc[-3]
+        prev_low_2 = stock_data['low'].iloc[-3]
+        prev_sma13_2 = stock_data['sma13'].iloc[-3]
+        prev_high_3 = stock_data['high'].iloc[-4]
+        prev_low_3 = stock_data['low'].iloc[-4]
+        prev_sma13_3 = stock_data['sma13'].iloc[-4]
         
         # Check if SMAs are valid (not NaN)
         if pd.isna(sma13) or pd.isna(sma200):
@@ -1256,11 +1262,11 @@ class StockIndicatorCalculator:
             return
 
         breakout_direction = CapitalTransactionType.BUY
-        broken_level = sma13  # Using 200 SMA as confirmation level
+        broken_level = sma13
 
-        if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13:
+        if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13 and prev_high_2 < prev_sma13_2 and prev_high_3 < prev_sma13_3:
             breakout_direction = CapitalTransactionType.BUY
-        elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13:
+        elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13 and prev_low_2 > prev_sma13_2 and prev_low_3 > prev_sma13_3:
             breakout_direction = CapitalTransactionType.SELL
         else:
             self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
