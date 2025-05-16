@@ -177,55 +177,68 @@ class StockIndicatorCalculator:
                     await self.db_con.save_data_to_db(batch_data)
 
 
+
     async def process_historical_combined_stock_data(self):
         for stock in self.epics:
             market_config = self.market_details.get(stock, {})
-            
-            # Process last 10 trading days
             days_checked = 0
-            current_date = datetime.now(pytz.UTC)               
-            
+            current_date = datetime.now(pytz.UTC)
+
             while days_checked < HISTORY_DATA_PERIOD:
                 current_date -= timedelta(days=1)
                 if not self.is_trading_day(current_date, market_config):
                     continue
-                    
+
                 days_checked += 1
                 day_start, day_end = self.get_market_hours_utc(current_date, market_config)
-                
                 if not day_start or not day_end:
                     continue
-                    
+
                 daily_data = pd.DataFrame()
                 current_batch_start = day_start
-                
+
                 while current_batch_start < day_end:
                     current_batch_end = min(
                         current_batch_start + timedelta(minutes=999),
                         day_end
                     )
-                    
-                    # Format timestamps
+
+                    # SKIP if already in DB
+                    if not await self.db_con.should_fetch_range(
+                        stock, 
+                        current_batch_start, 
+                        current_batch_end, 
+                        interval_minutes=1
+                    ):
+                        self.logger.info(
+                            f"Skipping {stock} data fetch from "
+                            f"{current_batch_start} to {current_batch_end} (already present)"
+                        )
+                        # advance cursor and continue
+                        current_batch_start = current_batch_end + timedelta(minutes=1)
+                        continue
+
                     start_str = current_batch_start.strftime('%Y-%m-%dT%H:%M:%S')
-                    end_str = current_batch_end.strftime('%Y-%m-%dT%H:%M:%S')
-                    
+                    end_str   = current_batch_end.strftime('%Y-%m-%dT%H:%M:%S')
                     self.logger.info(f"Fetching {stock} data from {start_str} to {end_str}")
+
                     batch_data = await self.capital_client.get_recent_data(
                         epic=stock,
                         start_dt_str=start_str,
                         end_dt_str=end_str,
                         interval='1minute'
                     )
-                    
+
                     if not batch_data.empty:
                         daily_data = pd.concat([daily_data, batch_data])
-                    
+
                     # Move to next batch (add 1 minute to avoid overlap)
                     current_batch_start = current_batch_end + timedelta(minutes=1)
-            
+
                 if not daily_data.empty:
                     await self.calculate_pivot_data(daily_data)
                     await self.db_con.save_data_to_db(daily_data)
+
 
     def get_market_hours_utc(self, date: datetime, market_config: dict):
         """Get trading hours for a specific date"""
@@ -832,8 +845,10 @@ class StockIndicatorCalculator:
 
         # Calculate min/max allowed distance in absolute terms based on entry price
         # min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
-        min_distance = max(entry_price * (details.min_stop_or_profit_distance / 100), entry_price * (details.min_guaranteed_stop_distance / 100) if details.min_guaranteed_stop_distance_unit == 'PERCENTAGE' else details.min_guaranteed_stop_distance)
-        max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+        min_grn_distance = entry_price * (details.min_guaranteed_stop_distance / 100) if details.min_guaranteed_stop_distance_unit == 'PERCENTAGE' else details.min_guaranteed_stop_distance
+        min_nrm_distance = entry_price * (details.min_stop_or_profit_distance / 100) if details.min_stop_or_profit_distance_unit == 'PERCENTAGE' else details.min_stop_or_profit_distance
+        min_distance = max(min_grn_distance, min_nrm_distance)
+        max_distance = entry_price * (details.max_stop_or_profit_distance / 100) if details.max_stop_or_profit_distance_unit == 'PERCENTAGE' else details.max_stop_or_profit_distance
 
         # --- Strategy Specific Logic ---
         # Calculate desired SL based on initial percentage (e.g., 2%)
@@ -1264,9 +1279,11 @@ class StockIndicatorCalculator:
         breakout_direction = CapitalTransactionType.BUY
         broken_level = sma13
 
-        if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13 and prev_high_2 < prev_sma13_2 and prev_high_3 < prev_sma13_3:
+        # if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13 and prev_high_2 < prev_sma13_2 and prev_high_3 < prev_sma13_3:
+        if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13:
             breakout_direction = CapitalTransactionType.BUY
-        elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13 and prev_low_2 > prev_sma13_2 and prev_low_3 > prev_sma13_3:
+        # elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13 and prev_low_2 > prev_sma13_2 and prev_low_3 > prev_sma13_3:
+        elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13:
             breakout_direction = CapitalTransactionType.SELL
         else:
             self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")

@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta
 from enum import Enum
 import json
+import math
 from typing import Optional
 import asyncpg
 import os
@@ -125,6 +126,32 @@ class DBConnection:
         async with self.pool.acquire() as connection:
             await connection.execute(query, *values)
 
+
+    async def should_fetch_range(
+        self, 
+        stock: str, 
+        start: datetime, 
+        end: datetime, 
+        interval_minutes: int = 1
+    ) -> bool:
+        """
+        Returns True if we need to fetch (i.e. stored count < expected),
+        False if the DB already has every 1-minute bar in [start, end].
+        """
+        # Compute expected number of 1-minute bars (inclusive)
+        delta_minutes = math.floor((end - start).total_seconds() / 60) + 1
+
+        query = """
+            SELECT COUNT(*) 
+              FROM historical_data 
+             WHERE stock = $1 
+               AND timestamp BETWEEN $2 AND $3
+        """
+        async with self.pool.acquire() as conn:
+            stored = await conn.fetchval(query, stock, start, end)
+
+        return stored < delta_minutes
+    
     async def fetch_existing_timestamps(self, stock: str):
         """Fetch existing timestamps from the database to avoid re-inserting."""
         query = """
