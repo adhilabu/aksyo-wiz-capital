@@ -37,7 +37,7 @@ SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 
 class StockIndicatorCalculator:
     TICK_SIZE = 0.01
-    TRADE_PERC = 0.005
+    TRADE_PERC = 0.006
     MAX_ADJUSTMENTS = 3
     TOTAL_TRADES_LIMIT = 10
     OPEN_TRADES_LIMIT = 5
@@ -826,174 +826,145 @@ class StockIndicatorCalculator:
         self,
         direction: CapitalTransactionType,
         entry_price: float,
-        details: CapitalMarketDetails, # Added details argument
+        details: CapitalMarketDetails,
         stock_data: pd.DataFrame
     ) -> float:
-        """Calculates Stop Loss price based on strategy and market rules."""
-        # Calculate step size for rounding final SL price
-        # Using entry_price to calculate percentage step if applicable
-        step = details.min_step_distance
+        """Calculates Stop Loss price based on strategy and Capital.com API rules."""
+        # 1. Determine rounding step
         if details.min_step_distance_unit == 'PERCENTAGE':
-            # Note: The step size as a percentage depends on the value it's applied to.
-            # Here we calculate it based on the entry price for consistency before rounding the final price.
-            step = entry_price * (details.min_step_distance / 100)
-            # Ensure step is positive
-            if step <= 0:
-                 # Fallback to the raw point value if percentage calculation is zero or negative
-                 step = details.min_step_distance
+            step = max(entry_price * (details.min_step_distance / 100), details.min_step_distance)
+        else:
+            step = details.min_step_distance
 
+        # 2. Compute allowed distances
+        # Guaranteed and normal stop distances
+        grn_unit = details.min_guaranteed_stop_distance_unit
+        nrm_unit = details.min_stop_or_profit_distance_unit
+        if grn_unit == 'PERCENTAGE':
+            min_grn = entry_price * (details.min_guaranteed_stop_distance / 100)
+        else:
+            min_grn = details.min_guaranteed_stop_distance
+        if nrm_unit == 'PERCENTAGE':
+            min_nrm = entry_price * (details.min_stop_or_profit_distance / 100)
+        else:
+            min_nrm = details.min_stop_or_profit_distance
 
-        # Calculate min/max allowed distance in absolute terms based on entry price
-        # min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
-        min_grn_distance = entry_price * (details.min_guaranteed_stop_distance / 100) if details.min_guaranteed_stop_distance_unit == 'PERCENTAGE' else details.min_guaranteed_stop_distance
-        min_nrm_distance = entry_price * (details.min_stop_or_profit_distance / 100) if details.min_stop_or_profit_distance_unit == 'PERCENTAGE' else details.min_stop_or_profit_distance
-        min_distance = max(min_grn_distance, min_nrm_distance)
-        max_distance = entry_price * (details.max_stop_or_profit_distance / 100) if details.max_stop_or_profit_distance_unit == 'PERCENTAGE' else details.max_stop_or_profit_distance
+        # For BUY ensure SL not too close, for SELL similarly
+        min_distance = max(min_grn, min_nrm)
 
-        # --- Strategy Specific Logic ---
-        # Calculate desired SL based on initial percentage (e.g., 2%)
-        sl_percent = self.TRADE_PERC # Assume self.TRADE_PERC is defined (e.g., 0.02 for 2%)
+        # Max distance
+        if details.max_stop_or_profit_distance_unit == 'PERCENTAGE':
+            max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+        else:
+            max_distance = details.max_stop_or_profit_distance
+
+        # 3. Base SL based on strategy percentage
+        sl_pct = self.TRADE_PERC
         if direction == CapitalTransactionType.BUY:
-            desired_sl = entry_price * (1 - sl_percent)
-        else: # CapitalTransactionType.SELL
-            desired_sl = entry_price * (1 + sl_percent)
+            desired_sl = entry_price * (1 - sl_pct)
+        else:
+            desired_sl = entry_price * (1 + sl_pct)
 
-        # Search for reversal candle and potentially use its low/high for SL
+        # 4. Optional: check for reversal candle SL override
         reversal_price = None
-        # Iterate backwards from the second to last candle (assuming last is current/entry)
-        # for i in reversed(range(1, len(stock_data))):
-        #      if i < 1: # Need at least one previous candle to check for reversal pattern
-        #          break
-        #      candle = stock_data.iloc[i]
-        #      prev_candle = stock_data.iloc[i - 1]
+        # for i in range(len(stock_data)-2, 0, -1):
+        #     prev = stock_data.iloc[i-1]
+        #     curr = stock_data.iloc[i]
+        #     bear_prev = prev['close'] < prev['open']
+        #     bull_prev = prev['close'] > prev['open']
+        #     bear_curr = curr['close'] < curr['open']
+        #     bull_curr = curr['close'] > curr['open']
+        #     if direction == CapitalTransactionType.BUY and bull_prev and bear_curr:
+        #         reversal_price = prev['low']; break
+        #     if direction == CapitalTransactionType.SELL and bear_prev and bull_curr:
+        #         reversal_price = prev['high']; break
 
-        #      # Basic reversal logic: check if the previous candle was opposite direction
-        #      is_bearish_prev = prev_candle['close'] < prev_candle['open']
-        #      is_bullish_prev = prev_candle['close'] > prev_candle['open']
-        #      is_current_bearish = candle['close'] < candle['open']
-        #      is_current_bullish = candle['close'] > candle['open']
-
-
-        #      if direction == CapitalTransactionType.BUY and is_bullish_prev and is_current_bearish:
-        #          # Potential bearish reversal (peak), low of the previous candle might be support
-        #          reversal_price = prev_candle['low']
-        #          break
-        #      elif direction == CapitalTransactionType.SELL and is_bearish_prev and is_current_bullish:
-        #          # Potential bullish reversal (trough), high of the previous candle might be resistance
-        #          reversal_price = prev_candle['high']
-        #          break
-
-        # If a reversal price was found, check if its distance is within allowed API range
         if reversal_price is not None:
-             reversal_distance = abs(entry_price - reversal_price)
-             if min_distance <= reversal_distance <= max_distance:
-                 self.logger.info(f"Using reversal candle price {reversal_price:.4f} for SL, distance {reversal_distance:.4f} is within API limits.")
-                 desired_sl = reversal_price
-             else:
-                 self.logger.info(f"Reversal candle price {reversal_price:.4f} found, but distance {reversal_distance:.4f} is outside API limits ({min_distance:.4f}-{max_distance:.4f}). Sticking to percentage-based SL.")
+            rev_dist = abs(entry_price - reversal_price)
+            if min_distance <= rev_dist <= max_distance:
+                desired_sl = reversal_price
 
-        # --- End Strategy Specific Logic ---
-
-
-        # --- Apply API Constraints ---
-        # Re-calculate current distance based on the potentially adjusted desired_sl
+        # 5. Apply API constraints
         current_distance = abs(entry_price - desired_sl)
-
-        # Ensure the final SL distance is within the min/max allowed by the API
         if current_distance < min_distance:
-            self.logger.warning(f"Calculated SL distance {current_distance:.4f} is below API minimum {min_distance:.4f}. Adjusting SL.")
-            app_min_distance = min_distance * 1.01
-            if direction == CapitalTransactionType.BUY:
-                desired_sl = entry_price - app_min_distance
-            else: # SELL
-                desired_sl = entry_price + app_min_distance
-        elif current_distance > max_distance:
-            self.logger.warning(f"Calculated SL distance {current_distance:.4f} exceeds API maximum {max_distance:.4f}. Adjusting SL.")
-            app_max_distance = max_distance * 0.99
-            if direction == CapitalTransactionType.BUY:
-                desired_sl = entry_price - app_max_distance
-            else: # SELL
-                desired_sl = entry_price + app_max_distance
-        
-        # --- End Apply API Constraints ---
-        # check if the desired SL is greater than the min_guaranteed_stop_distance PERCENTAGE if not set it as the value
+            self.logger.warning(f"SL distance {current_distance:.4f} < min {min_distance:.4f}, adjusting.")
+            adj = min_distance * 1.01
+            desired_sl = entry_price - adj if direction == CapitalTransactionType.BUY else entry_price + adj
+            current_distance = abs(entry_price - desired_sl)
+        if current_distance > max_distance:
+            self.logger.warning(f"SL distance {current_distance:.4f} > max {max_distance:.4f}, adjusting.")
+            adj = max_distance * 0.99
+            desired_sl = entry_price - adj if direction == CapitalTransactionType.BUY else entry_price + adj
+            current_distance = abs(entry_price - desired_sl)
+
+        # 6. Enforce guaranteed stop at least
         if details.min_guaranteed_stop_distance > 0:
-            min_guaranteed_stop_distance = entry_price * (details.min_guaranteed_stop_distance / 100) if details.min_guaranteed_stop_distance_unit == 'PERCENTAGE' else details.min_guaranteed_stop_distance
-            if current_distance < min_guaranteed_stop_distance:
-                desired_sl = entry_price - min_guaranteed_stop_distance if direction == CapitalTransactionType.BUY else entry_price + min_guaranteed_stop_distance
+            if grn_unit == 'PERCENTAGE':
+                grn_min = entry_price * (details.min_guaranteed_stop_distance / 100)
+            else:
+                grn_min = details.min_guaranteed_stop_distance
+            if current_distance < grn_min:
+                desired_sl = entry_price - grn_min if direction == CapitalTransactionType.BUY else entry_price + grn_min
 
-
-        # Finally, round the desired SL price to the nearest valid step
-        round_dir = False if direction == CapitalTransactionType.BUY else True
-        final_sl = self.round_to_increment(desired_sl, step, round_up=round_dir)
-
-        self.logger.info(f"Calculated final SL price: {final_sl:.4f}")
+        # 7. Round to valid increment
+        round_up = (direction == CapitalTransactionType.SELL)
+        final_sl = self.round_to_increment(desired_sl, step, round_up=round_up)
+        self.logger.info(f"Final SL set to {final_sl:.4f}")
         return final_sl
+
 
     async def calculate_pl_for_breakout(
         self,
         direction: CapitalTransactionType,
         entry_price: float,
-        stop_loss: float, # The calculated and rounded stop loss price
-        details: CapitalMarketDetails # Added details argument
+        stop_loss: float,
+        details: CapitalMarketDetails
     ) -> float:
-        """Calculates Profit Level price based on SL and market rules (1:2 RR)."""
-        # Calculate step size for rounding final PL price
-        # Using entry_price to calculate percentage step if applicable
-        step = details.min_step_distance
+        """Calculates Profit Level price based on SL and Capital.com API rules (1:2 RR by default)."""
+        # 1. Determine rounding step
         if details.min_step_distance_unit == 'PERCENTAGE':
-            # Note: The step size as a percentage depends on the value it's applied to.
-            # Here we calculate it based on the entry price for consistency before rounding the final price.
-            step = entry_price * (details.min_step_distance / 100)
-            # Ensure step is positive
-            if step <= 0:
-                 # Fallback to the raw point value if percentage calculation is zero or negative
-                 step = details.min_step_distance
+            step = max(entry_price * (details.min_step_distance / 100), details.min_step_distance)
+        else:
+            step = details.min_step_distance
 
-        # Calculate min/max allowed distance in absolute terms based on entry price
-        min_distance = entry_price * (details.min_stop_or_profit_distance / 100)
-        max_distance = entry_price * (details.max_stop_or_profit_distance / 100)
+        # 2. Compute API min/max distances
+        def to_abs(value, unit):
+            return entry_price * (value / 100) if unit == 'PERCENTAGE' else value
 
-        # --- Strategy Specific Logic ---
-        # Calculate risk (absolute distance between entry and calculated SL)
+        min_distance = to_abs(details.min_stop_or_profit_distance, details.min_stop_or_profit_distance_unit)
+        max_distance = to_abs(details.max_stop_or_profit_distance, details.max_stop_or_profit_distance_unit)
+
+        # 3. Strategy: calculate risk and reward (1:2 RR)
         risk = abs(entry_price - stop_loss)
+        reward = risk * 2  # for 1:2 RR
 
-        # Calculate desired reward based on Risk/Reward ratio (e.g., 1:2)
-        reward = 1 * risk # Assuming a 1:2 Risk-Reward ratio strategy
-
-        # Calculate desired PL price based on entry price and reward
         if direction == CapitalTransactionType.BUY:
             desired_pl = entry_price + reward
-        else: # CapitalTransactionType.SELL
+        else:
             desired_pl = entry_price - reward
-        # --- End Strategy Specific Logic ---
 
-        # --- Apply API Constraints ---
-        # Re-calculate current distance based on the potentially adjusted desired_pl
+        # 4. Apply API constraints
         current_distance = abs(entry_price - desired_pl)
-
-        # Ensure the final PL distance is within the min/max allowed by the API
         if current_distance < min_distance:
-            self.logger.warning(f"Calculated PL distance {current_distance:.4f} is below API minimum {min_distance:.4f}. Adjusting PL.")
-            if direction == CapitalTransactionType.BUY:
-                desired_pl = entry_price + min_distance
-            else: # SELL
-                desired_pl = entry_price - min_distance
+            self.logger.warning(
+                f"PL distance {current_distance:.4f} < API min {min_distance:.4f}, adjusting to min."
+            )
+            desired_pl = entry_price + min_distance if direction == CapitalTransactionType.BUY else entry_price - min_distance
+            current_distance = abs(entry_price - desired_pl)
         elif current_distance > max_distance:
-            self.logger.warning(f"Calculated PL distance {current_distance:.4f} exceeds API maximum {max_distance:.4f}. Adjusting PL.")
-            if direction == CapitalTransactionType.BUY:
-                desired_pl = entry_price + max_distance
-            else: # SELL
-                desired_pl = entry_price - max_distance
-        # --- End Apply API Constraints ---
+            self.logger.warning(
+                f"PL distance {current_distance:.4f} > API max {max_distance:.4f}, adjusting to max."
+            )
+            desired_pl = entry_price + max_distance if direction == CapitalTransactionType.BUY else entry_price - max_distance
+            current_distance = abs(entry_price - desired_pl)
 
+        # 5. Round to valid increment
+        round_up = direction == CapitalTransactionType.BUY
+        final_pl = self.round_to_increment(desired_pl, step, round_up=round_up)
 
-        # Finally, round the desired PL price to the nearest valid step
-        round_dir = True if direction == CapitalTransactionType.BUY else False
-        final_pl = self.round_to_increment(desired_pl, step, round_up=round_dir)
-
-        self.logger.info(f"Calculated final PL price: {final_pl:.4f}")
+        self.logger.info(f"Final PL set to {final_pl:.4f}")
         return final_pl
+
 
 
     async def get_base_payload_for_capital_order(self, epic: str, stock_ltp: float,
@@ -1280,14 +1251,14 @@ class StockIndicatorCalculator:
         broken_level = sma13
 
         # if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13 and prev_high_2 < prev_sma13_2 and prev_high_3 < prev_sma13_3:
-        if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13:
-            breakout_direction = CapitalTransactionType.BUY
-        # elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13 and prev_low_2 > prev_sma13_2 and prev_low_3 > prev_sma13_3:
-        elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13:
-            breakout_direction = CapitalTransactionType.SELL
-        else:
-            self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
-            return
+        # if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13:
+        #     breakout_direction = CapitalTransactionType.BUY
+        # # elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13 and prev_low_2 > prev_sma13_2 and prev_low_3 > prev_sma13_3:
+        # elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13:
+        #     breakout_direction = CapitalTransactionType.SELL
+        # else:
+        #     self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
+        #     return
 
         # pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data, breakout_direction)
         # if not pivot_broken:
