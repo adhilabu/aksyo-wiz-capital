@@ -2,6 +2,8 @@
 import os
 import json
 from typing import List, Dict, Optional
+
+from dotenv import load_dotenv
 from app.capital.capital_com import CapitalComAPI
 from app.redis.redis import RedisCache # Assuming RedisCache is still used
 from datetime import datetime, timedelta
@@ -16,6 +18,7 @@ CACHE_EXPIRY_HOURS = 24 # Cache instruments for 24 hours
 # Initialize the API client (outside functions to reuse session if possible, or inside if needed per call)
 # Consider how session management should work across different modules
 # api_client = CapitalComAPI()
+load_dotenv(dotenv_path=".env", override=True) 
 
 def is_cache_valid(cached_data: Optional[Dict]) -> bool:
     """Check if the cached instrument data is still valid."""

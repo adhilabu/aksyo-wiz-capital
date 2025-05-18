@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from dotenv import load_dotenv
 # from app.ws.feed_backtest import fetch_market_data_test
 
-load_dotenv()
+load_dotenv(dotenv_path=".env", override=True) 
 
 # Configurations
 PULSAR_URL = os.getenv('PULSAR_URL', '')

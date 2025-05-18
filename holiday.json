@@ -115,6 +115,14 @@
         "holidays": [],
         "leverage": "2:1"
     },
+    "ETHUSD": {
+        "open": "00:00",
+        "close": "23:59",
+        "timezone": "UTC",
+        "weekend_trading": true,
+        "holidays": [],
+        "leverage": "2:1"
+    },
     "USCOCOA": {
         "open": "04:45",
         "close": "13:30",
