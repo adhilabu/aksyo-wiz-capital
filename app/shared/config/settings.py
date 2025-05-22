@@ -3,6 +3,8 @@ from pydantic import Field, field_validator, model_validator
 from typing import Optional, List
 from dotenv import load_dotenv
 
+from app.analyse.schemas import TradeAnalysisType
+
 # Load environment variables from .env file
 load_dotenv(dotenv_path=".env", override=True)
 
@@ -42,6 +44,8 @@ class Settings(BaseSettings):
     
     # UI_INSTRUMENTS_LIST: List[str] = Field(default_factory=lambda: ["ETHUSD,EURUSD","USDJPY","J225","US30","BTCUSD"])
     UI_INSTRUMENTS: str = "OIL_CRUDE,US100,GOLD,J225,US30,BTCUSD"
+    TRADE_ANALYSIS_TYPE: TradeAnalysisType = TradeAnalysisType.NORMAL
+    PULSAR_TOPIC: str = 'capital-topic'
 
     class Config:
         env_file = ".env"

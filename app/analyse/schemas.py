@@ -22,6 +22,7 @@ class IndicatorValues(BaseModel):
 
 class TradeAnalysisType(str, Enum):
     NORMAL = "normal"
+    ORB = "orb"
 
 @dataclass
 class Trade:

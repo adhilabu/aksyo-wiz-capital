@@ -104,10 +104,10 @@ class StockIndicatorCalculator:
                     await self.update_stock_data(row)
             except Exception as e:
                 self.logger.error(f"Error processing row: {e}")
-        for _, row in transformed_data.iterrows():
-            await self.update_stock_data(row)
-        # tasks = [self.update_stock_data(row) for _, row in transformed_data.iterrows()]
-        # await asyncio.gather(*tasks)
+        # for _, row in transformed_data.iterrows():
+        #     await self.update_stock_data(row)
+        tasks = [self.update_stock_data(row) for _, row in transformed_data.iterrows()]
+        await asyncio.gather(*tasks)
         timestamp = transformed_data.iloc[0]['timestamp'] if len(transformed_data) > 0 else 'Empty'
         self.logger.info(f"Inserted data for timestamp: {timestamp}.")
 
@@ -122,9 +122,12 @@ class StockIndicatorCalculator:
         self.logger.info(f"Inserting data for stock: {stock} and timestamp: {timestamp}.")
         await self.db_con.save_data_to_db(data.to_frame().T)
 
-        # await self.analyze_reversal_breakout_strategy(stock, timestamp)
-        await self.analyze_sma_strategy(stock)
-        return
+        if TRADE_ANALYSIS_TYPE == TradeAnalysisType.NORMAL:
+            await self.analyze_sma_strategy(stock)
+            return
+
+        await self.analyze_reversal_breakout_strategy(stock, timestamp)
+    
 
     async def get_stock_ltp(self, stock, current_price):
         stock_ltp = await self.db_con.fetch_stock_ltp_from_db(stock) or current_price
