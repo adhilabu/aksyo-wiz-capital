@@ -39,8 +39,8 @@ class StockIndicatorCalculator:
     TICK_SIZE = 0.01
     TRADE_PERC = 0.006
     MAX_ADJUSTMENTS = 3
-    TOTAL_TRADES_LIMIT = 10
-    OPEN_TRADES_LIMIT = 5
+    TOTAL_TRADES_LIMIT = 30
+    OPEN_TRADES_LIMIT = 15
     LOSS_TRADE_LIMIT = 5
 
     def __init__(self, db_connection: DBConnection, redis_cache: RedisCache, start_date=None, end_date=None, test_mode=False):
@@ -104,8 +104,10 @@ class StockIndicatorCalculator:
                     await self.update_stock_data(row)
             except Exception as e:
                 self.logger.error(f"Error processing row: {e}")
-        tasks = [self.update_stock_data(row) for _, row in transformed_data.iterrows()]
-        await asyncio.gather(*tasks)
+        for _, row in transformed_data.iterrows():
+            await self.update_stock_data(row)
+        # tasks = [self.update_stock_data(row) for _, row in transformed_data.iterrows()]
+        # await asyncio.gather(*tasks)
         timestamp = transformed_data.iloc[0]['timestamp'] if len(transformed_data) > 0 else 'Empty'
         self.logger.info(f"Inserted data for timestamp: {timestamp}.")
 
@@ -120,6 +122,7 @@ class StockIndicatorCalculator:
         self.logger.info(f"Inserting data for stock: {stock} and timestamp: {timestamp}.")
         await self.db_con.save_data_to_db(data.to_frame().T)
 
+        # await self.analyze_reversal_breakout_strategy(stock, timestamp)
         await self.analyze_sma_strategy(stock)
         return
 
@@ -340,88 +343,72 @@ class StockIndicatorCalculator:
     async def check_and_execute_exit_trade_type_2(self, stock_data: pd.DataFrame):
         """Check and execute exit conditions for open trades based on strategy type 2."""
         current_timestamp = stock_data['timestamp']
-        stock = stock_data['stock'] # EPIC
+        stock = stock_data['stock']  # EPIC
         current_ltp = stock_data['ltp']
         current_close = stock_data['close']
         current_low = stock_data['low']
         current_high = stock_data['high']
 
-        # Fetch open trades (assuming DB stores dealId or dealReference)
+        # Fetch open trades
         open_trades: list[Trade] = await self._fetch_open_trades(stock, current_timestamp)
         if not open_trades:
             return
 
-        # Handle EOD square off first
-        if await self._handle_eod_square_off(current_timestamp, stock, current_close):
-            return
-
         executed_trades_updates = []
         for trade in open_trades:
-            # Capital.com: Check position/order status using dealId/dealReference
-            # This logic needs refinement based on how dealReference/dealId are stored and confirmed
-            if not trade.order_status: # If DB status is not confirmed
-                confirmed = False
-                if trade.deal_reference: # Check confirmation using reference
-                    confirmation = await self.capital_client.get_confirmation(trade.deal_reference)
-                    if confirmation and confirmation.get('dealStatus') == 'ACCEPTED':
-                        trade.deal_id = confirmation.get('dealId')
-                        trade.order_status = True
-                        confirmed = True
-                        # Update DB with dealId and status
-                        await self.db_con.update_trade_confirmation(trade.id, trade.deal_id, True)
-                    elif confirmation and confirmation.get('dealStatus') == 'REJECTED':
-                        # Handle rejection - update DB to closed/failed status
-                        await self.db_con.update_trade_status(trade.id, TradeStatus.FAILED, current_ltp, current_ltp)
-                        continue # Move to next trade
-                    # else: Still pending confirmation
-                
-                # If still not confirmed, potentially check working orders if it was LIMIT/STOP
-                # Or check open positions if it was MARKET
-                # This part depends heavily on the exact workflow and API details
-                if not confirmed:
-                    # Placeholder: Assume test mode logic or skip if not confirmed
-                    if self.test_mode:
-                        # Simplified test mode check
-                        if trade.trade_type == CapitalTransactionType.BUY and current_low <= trade.entry_cp:
-                            trade.order_status = True
-                        elif trade.trade_type == CapitalTransactionType.SELL and current_high >= trade.entry_cp:
-                            trade.order_status = True
-                        if trade.order_status:
-                             await self.db_con.update_trade_confirmation(trade.id, f"test_{trade.id}", True) # Use dummy dealId for test
-                             trade.deal_id = f"test_{trade.id}"
-                    else:
-                        # In live mode, if confirmation isn't found after some time, might need manual check or different logic
-                        self.logger.debug(f"Trade {trade.id} for {stock} not confirmed yet.")
-                        continue # Skip processing this trade for now
-            
-            # If order/position is confirmed (trade.order_status is True and trade.deal_id exists)
-            if trade.order_status and trade.deal_id:
-                # Pass both current_close (for logic) and current_ltp (for DB update)
-                adjusted = await self._adjust_sl_pl(
-                    trade,
-                    current_ltp  # Added current LTP parameter
-                )
-                
-                if not adjusted:
-                    status, exit_price = await self._check_exit_conditions(trade, current_ltp)
-                    if status:
-                        # Execute exit using dealId
-                        exit_ref = await self._execute_exit(trade, status, current_ltp)
-                        if exit_ref: # Check if exit request was successful
-                            # Update DB status
+            # Check if the order is already confirmed
+            if not trade.order_status:
+                if trade.deal_id:
+                    response = await self.capital_client.get_deal_reference_status(trade.deal_id)
+                    trade.order_status = response.get('order_status')
+                    trade.metadata_json['working_order_id'] = response.get('working_order_id')
+                    await self.db_con.update_metadata_json(trade.id, trade.metadata_json)
+                    await self.db_con.update_final_order_status(trade.id, trade.order_status)
+                    continue        
+
+            # If order is confirmed, check exit conditions
+            if trade.order_status:
+                working_order_id = trade.metadata_json.get("working_order_id")
+                if working_order_id:
+                    position_data = await self.capital_client.get_position_status_working_id(working_order_id)
+                    if position_data and position_data.get("deal_id"):
+                        trade.metadata_json.update(position_data)
+                        if position_data.get("position_status") == "CLOSED":
+                            profit_or_loss_status = position_data.get("profit_loss_status")
+                            profit_or_loss_amount = position_data.get("profit_loss_status")
+                            # self.logger.info(f"Trade {trade.id} exitted with status {trade.order_status} (Deal ID: {trade.deal_id})")
+                            self.logger.info(f"Trade {trade.id} exitted with status {profit_or_loss_status} and amount {profit_or_loss_amount} (Deal ID: {trade.deal_id})")
                             executed_trades_updates.append((
-                                status.value, trade.id, current_ltp,
-                                exit_price, stock
+                                TradeStatus.PROFIT if position_data["profit_loss_status"] == "PROFIT" else TradeStatus.LOSS,
+                                current_ltp,
+                                current_ltp,
+                                stock,
+                                trade.id,
                             ))
-                        else:
-                            self.logger.error(f"Failed to execute exit for trade {trade.id} (Deal ID: {trade.deal_id})")
+
+                        await self.db_con.update_metadata_json(trade.id, trade.metadata_json)
+                    
+                    else:
+                        self.logger.warning(f"No positions found for trade id {trade.id}. So assuming it as exitted.")
+                        executed_trades_updates.append((
+                            TradeStatus.PROFIT if trade.metadata_json.get("profit_loss_status") == "PROFIT" else TradeStatus.LOSS,
+                            current_ltp,
+                            current_ltp,
+                            stock,
+                            trade.id,
+                        ))
+                        continue
+                        
 
         # Batch update DB for executed exits
         if executed_trades_updates:
             await self.db_con.update_trade_statuses(executed_trades_updates)
-
-    async def update_open_trades_status(self, stock: str, current_timestamp):
+            
+    async def update_open_trades_status(self, stock_data: pd.DataFrame):
         """Check and update exit conditions for open/closed trades."""
+        current_timestamp = stock_data['timestamp'].iloc[-1]
+        stock = stock_data['stock'].iloc[-1]  # EPIC
+        current_ltp = stock_data['ltp'].iloc[-1]
         open_trades: list[Trade] = await self._fetch_open_trades(stock, current_timestamp)
         if not open_trades:
             return
@@ -439,6 +426,14 @@ class StockIndicatorCalculator:
                     deal_id = working_pos_data["deal_id"]
                     metadata_json["deal_id"] = deal_id
                     await self.db_con.update_metadata_json(trade.id, metadata_json)
+                if working_pos_data.get("position_status") == "CLOSED":
+                    profit_or_loss_status = working_pos_data.get("profit_loss_status")
+                    profit_or_loss_amount = working_pos_data.get("profit_loss_amount")
+                    # self.logger.info(f"Trade {trade.id} exitted with status {trade.order_status} (Deal ID: {trade.deal_id})")
+                    self.logger.info(f"Trade {trade.id} exitted with status {profit_or_loss_status} and amount {profit_or_loss_amount} (Deal ID: {trade.deal_id})")
+                    executed_trades_updates.append((working_pos_data["position_status"], trade.id))
+
+                await self.db_con.update_metadata_json(trade.id, trade.metadata_json)
 
             # Step 2: Check position status using deal_id (includes closed positions)
             if deal_id:
@@ -648,143 +643,68 @@ class StockIndicatorCalculator:
         reversal_high = pre_reversal_candles['high'].max()
         reversal_low = pre_reversal_candles['low'].min()
         reversal_time = today_data.iloc[reversal_idx]['timestamp']
-        
+
+        if reversal_time.tzinfo is not None:
+            local_tz = pytz.timezone('Asia/Kolkata')
+            reversal_time = reversal_time.astimezone(local_tz).replace(tzinfo=None)
+
         self.logger.info(f"Candle color reversal {stock} detected at {reversal_time}. High: {reversal_high}, Low: {reversal_low}")
         return (reversal_high, reversal_low, reversal_time)
 
-    async def get_or_calculate_index_reversal_data(self, index_symbol, index_data_5_min):
-        """
-        Returns stored index reversal data if available, otherwise calculates it.
-        """
-        # Check if we already have reversal data for this index
-        if index_symbol in self.index_reversal_data:
-            return self.index_reversal_data[index_symbol]
-        
-        # Calculate new reversal data since we don't have it stored
-        reversal_data = await self.identify_candle_color_reversal(index_data_5_min)
-        
-        # Store the reversal data if found
-        if reversal_data:
-            self.index_reversal_data[index_symbol] = reversal_data
-            
-        return reversal_data
-
-    async def check_index_confirmation(self, stock, breakout_direction, stock_reversal_time=None):
-        """
-        Checks if the corresponding index confirms the breakout direction.
-        Returns True if confirmed, False otherwise.
-        """
-        # Determine the index for this stock
-        current_index_price = None
-        index_symbol = self.stock_index_map.get(stock)
-        if not index_symbol:
-            return False
-        
-        # Check if we already have reversal data for this index
-        index_reversal_data = self.index_reversal_data.get(index_symbol)
-        if index_reversal_data is None:
-            # Load index data
-            index_data = await self.db_con.load_data_from_db(index_symbol, self.end_date, self.end_date)
-            if index_data.empty:
-                return False
-            
-            # Transform to 5-min data if needed
-            index_data_5_min = await self.transform_1_min_data_to_5_min_data(index_symbol, index_data)
-            if index_data_5_min.empty:
-                return False
-
-            index_reversal_data = await self.identify_candle_color_reversal(index_data_5_min)
-            
-            # Store the reversal data if found
-            if index_reversal_data is None:
-                return False
-
-            self.index_reversal_data[index_symbol] = index_reversal_data
-
-        index_high, index_low, index_reversal_time = index_reversal_data
-        current_index_price = await self.db_con.fetch_stock_ltp_from_db(index_symbol)
-
-        if stock_reversal_time and index_reversal_time != stock_reversal_time:
-            return False
-
-        # Check if index confirms the stock's breakout direction
-        if breakout_direction == CapitalTransactionType.BUY and current_index_price > index_high:
-            return True
-        elif breakout_direction == CapitalTransactionType.SELL and current_index_price < index_low:
-            return True
-        
-        return False
-
-    async def valid_market_sentiment(self, breakout_direction):
-        """
-        Checks market sentiment with the breakout direction.
-        Returns True if confirmed, False otherwise.
-        """
-        index_data = await self.db_con.load_data_from_db(NIFTY_50_SYMBOL, self.end_date - timedelta(days=10), self.end_date)
-        if index_data.empty:
-            return None
-
-        # Transform to 5-min data
-        index_data_5_min = await self.transform_1_min_data_to_5_min_data(NIFTY_50_SYMBOL, index_data)
-        if index_data_5_min.empty:
-            return False
-
-        # Ensure timestamp is datetime type
-        index_data_5_min['timestamp'] = pd.to_datetime(index_data_5_min['timestamp'])
-        
-        # Get unique trading dates
-        trading_dates = sorted(index_data_5_min['timestamp'].dt.date.unique())
-        current_date = self.end_date.date()
-        
-        # Find the most recent trading date before the current day
-        previous_trading_dates = [d for d in trading_dates if d < current_date]
-        if not previous_trading_dates:
-            return False
-        previous_day_date = previous_trading_dates[-1]
-        
-        # Extract previous trading day's data
-        previous_day_data = index_data_5_min[index_data_5_min['timestamp'].dt.date == previous_day_date]
-        if previous_day_data.empty:
-            return False
-        previous_day_close = previous_day_data['close'].iloc[-1]
-
-        # Extract current day's 5-min data
-        current_day_data = index_data_5_min[index_data_5_min['timestamp'].dt.date == current_date]
-        if current_day_data.empty:
-            return False
-
-        current_close = current_day_data['close'].iloc[-1]
-        current_open = current_day_data['open'].iloc[0]
-
-        # Count bullish/bearish candles
-        # bullish_candles = (current_day_data['close'] > current_day_data['open']).sum()
-        # bearish_candles = (current_day_data['close'] < current_day_data['open']).sum()
-
-        # Validate breakout direction
-        if breakout_direction == CapitalTransactionType.BUY:
-            return (current_close >= previous_day_close)
-        elif breakout_direction == CapitalTransactionType.SELL:
-            return (current_close <= previous_day_close)
-        return False
-
-
     async def get_or_calculate_reversal_data(self, stock_symbol, stock_data_5_min):
-        """
-        Returns stored reversal data if available, otherwise calculates it.
-        """
-        # Check if we already have reversal data for this stock
-        just_created = False
+        # if cached already, skip recalculation
         if stock_symbol in self.stock_reversal_data:
-            return just_created, self.stock_reversal_data[stock_symbol]
-        
-        # Calculate new reversal data since we don't have it stored
-        reversal_data = await self.identify_candle_color_reversal(stock_data_5_min)
-        
-        # Store the reversal data if found
+            return False, self.stock_reversal_data[stock_symbol]
+
+        # load market open info (all times in UTC)
+        open_str = self.market_details[stock_symbol]['open']    # e.g. "13:30" UTC
+        tz_name  = self.market_details[stock_symbol]['timezone']  # e.g. "America/New_York"
+        market_tz = pytz.timezone(tz_name)
+        local_tz = pytz.timezone('Asia/Kolkata')
+        if not open_str:
+            self.logger.error(f"Missing market open time for {stock_symbol}.")
+            return False, None
+
+        # parse open time in UTC
+        market_open_time = datetime.strptime(open_str, "%H:%M").time()
+
+        # determine relevant date: today or yesterday based on open time
+        now_utc = datetime.now(market_tz)
+        today_utc = now_utc.date()
+        # combine today's date with market open time
+        open_datetime_today = datetime.combine(today_utc, market_open_time, tzinfo=market_tz)
+        if open_datetime_today > now_utc:
+            # before today's open, use yesterday's open
+            relevant_date = today_utc - timedelta(days=1)
+            open_datetime_today = open_datetime_today - timedelta(days=1)
+        else:
+            relevant_date = today_utc
+
+        # standardize timestamps: ensure UTC-aware
+        df = stock_data_5_min.copy()
+        if df['timestamp'].dt.tz is None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize(local_tz)
+        df['timestamp_utc'] = df['timestamp'].dt.tz_convert(market_tz)
+         
+        open_bars = df[df['timestamp_utc'] >= open_datetime_today]
+
+        # attempt to load stored reversal data
+        db_data = await self.db_con.get_reversal_data(stock_symbol, relevant_date, 'stock')
+        if db_data:
+            self.stock_reversal_data[stock_symbol] = db_data
+            return False, db_data
+
+        # compute reversal on filtered bars
+        reversal_data = await self.identify_candle_color_reversal(open_bars)
         if reversal_data:
+            rh, rl, rt = reversal_data
+            await self.db_con.save_reversal_data(stock_symbol, relevant_date, rh, rl, rt, 'stock')
             self.stock_reversal_data[stock_symbol] = reversal_data
-            just_created = True
-        return just_created, reversal_data
+            return True, reversal_data
+
+        # no reversal found
+        return False, None
+
 
     async def ensure_market_details(self, epic: str, timestamp) -> Optional[CapitalMarketDetails]:
         """Ensure market details are available, fetching from API if necessary"""
@@ -936,7 +856,7 @@ class StockIndicatorCalculator:
 
         # 3. Strategy: calculate risk and reward (1:2 RR)
         risk = abs(entry_price - stop_loss)
-        reward = risk * 2  # for 1:2 RR
+        reward = risk * 1.2  # for 1:2 RR
 
         if direction == CapitalTransactionType.BUY:
             desired_pl = entry_price + reward
@@ -1073,8 +993,8 @@ class StockIndicatorCalculator:
             return False
         return True
         
-    async def analyze_reversal_breakout_strategy(self, stock) -> None:
-        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=5), self.end_date)
+    async def analyze_reversal_breakout_strategy(self, stock, timestamp) -> None:
+        stock_data: pd.DataFrame = await self.db_con.load_data_from_db_with_timestamp(stock, self.end_date - timedelta(days=5), timestamp)
         if stock_data.empty:
             return
 
@@ -1082,123 +1002,164 @@ class StockIndicatorCalculator:
         final_timestamp = final_stock_data['timestamp']
         
         # Existing checks remain unchanged
-        await self.check_and_execute_exit_trade_type_2(final_stock_data)
-        if stock in self.executed_breakouts and self.executed_breakouts[stock]:
-            self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
-            return
+        # await self.check_and_execute_exit_trade_type_2(final_stock_data)
+        await self.update_open_trades_status(stock_data)
+        # if stock in self.executed_breakouts and self.executed_breakouts[stock]:
+        #     self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
+        #     return
     
-        results = await self.db_con.get_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT, total_count=self.TOTAL_TRADES_LIMIT)
-        if any(results):
-            self.logger.info(f"RH: {stock}: Condition met, skipping trade")
+        if (final_timestamp.minute + 1) % 5 != 0:
             return
+
+        # results = await self.db_con.get_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT, total_count=self.TOTAL_TRADES_LIMIT)
+        # if any(results):
+        #     self.logger.info(f"HN :{stock}: Condition met, skipping trade")
+        #     return
+
+        results = await self.db_con.get_open_trade_stats(stock, open_count=20)
+        if any(results):
+            self.logger.info(f"HN :{stock}: Condition met, skipping trade")
+            return
+
+        # Existing data processing remains unchanged
+        stock_data_5_min = await self.transform_1_min_data_to_5_min_data(stock, stock_data)
+        if stock_data_5_min.empty:
+            return
+
+        just_created, reversal_data = await self.get_or_calculate_reversal_data(stock, stock_data_5_min)
+        if not reversal_data:
+            return
+        
+        reversal_high, reversal_low, reversal_time = reversal_data
+        current_timestamp = stock_data_5_min['timestamp'].iloc[-1]
+        if reversal_time == current_timestamp:
+            return
+        
+        post_reversal_data = stock_data_5_min[
+            (stock_data_5_min['timestamp'] > reversal_time) & 
+            (stock_data_5_min['timestamp'] < current_timestamp)
+        ]
         
         current_price = final_stock_data['ltp']
         breakout_direction = None
-
         
-        pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data, breakout_direction)
-        if not pivot_broken:
-            self.logger.info(f"RH: stock: Didn't broke any pivot levels")
+        if current_price > reversal_high:
+            breakout_direction = CapitalTransactionType.BUY
+            broken_level = reversal_high
+        elif current_price < reversal_low:
+            breakout_direction = CapitalTransactionType.SELL
+            broken_level = reversal_low
+        else:
             return
+        
+        already_broken = False
+        if not post_reversal_data.empty:
+            if breakout_direction == CapitalTransactionType.BUY:
+                already_broken = (post_reversal_data['close'] > reversal_high).any()
+            else:
+                already_broken = (post_reversal_data['close'] < reversal_low).any()
+
+
+        # Mark breakout as executed for today
+        # self.executed_breakouts[stock] = True
+
+        if already_broken:
+            self.logger.info(f"{stock}: Breakout already occurred in historical data. Skipping.")
+            return
+        
+        # if not await self.check_index_confirmation(stock, breakout_direction, reversal_time):
+        #     self.logger.info(f"HN {stock}: Index does not confirm the breakout direction")
+        #     return
+
+        index_confirmation = True
+        # nifty_in_confirmation = await self.check_index_confirmation(breakout_direction, stock_reversal_time=reversal_time)
+        
+        # pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data_5_min, breakout_direction)
+        # if not pivot_broken:
+        #     self.logger.info(f"HN {stock}: Didn't broke any pivot levels")
+        #     return
         
 
         # Calculate dynamic position size based on volatility
-        atr = await self.calculate_atr(stock_data)
+        atr = await self.calculate_atr(stock_data_5_min)
         
         # In analyze_reversal_breakout_strategy:
+        # Determine SL and PL based on breakout direction
         stock_ltp = await self.get_stock_ltp(stock, current_price)
-        sl = await self.calculate_sl_for_breakout(breakout_direction, stock_ltp)
-        pl = await self.calculate_pl_for_breakout(breakout_direction, stock_ltp)
-
-        # Create payload for Capital.com order
+        # Prepare order payload
+        order_type = CapitalOrderType.MARKET
         base_payload = await self.get_base_payload_for_capital_order(
             epic=stock,
-            stock_ltp=stock_ltp, # This might be used as the level for LIMIT/STOP
-            stop_loss=sl,
-            profit_level=pl,
+            stock_ltp=stock_ltp,
             trans_type=breakout_direction,
-            order_type=CapitalOrderType.MARKET # Defaulting to MARKET, adjust if needed
+            order_type=order_type,
+            timestamp=current_timestamp,
+            stock_data=stock_data
         )
         
         if not base_payload:
             return
         
+        # stock_name = self.stock_name_map.get(stock, stock)
+
+        # Place order and log trade
+        # rsi, adx, mfi = await asyncio.gather(
+        #     self.calculate_rsi_talib(stock_data_5_min),
+        #     self.calculate_adx_talib(stock_data_5_min),
+        #     self.calculate_mfi_talib(stock_data_5_min)
+        # )
+
+        rsi = 0
+        adx = 0
+        mfi = 0
+        
+        indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
+
         await asyncio.sleep(random.uniform(0, 1))
 
-        # # Redis keys
-        # stock_ts_key = f"order:{stock}:{final_timestamp}"
-        # ts_count_key = f"trade_count:{final_timestamp}"
-    
-        
-        # # Check and set stock-specific timestamp key using SETNX
-        # if not self.redis_cache.client.setnx(stock_ts_key, 1):
-        #     # self.logger.info(f"Order for {stock} in {final_timestamp} exists. Skipping.")
-        #     return
-
-        # # Set TTL for the stock key (e.g., 5 minutes)
-        # self.redis_cache.client.expire(stock_ts_key, 100)
-        
-        # # Increment and check timestamp trade count
-        # current_count = self.redis_cache.client.incr(ts_count_key)
-        # # Set TTL on timestamp count key if first increment
-        # if current_count == 1:
-        #     self.redis_cache.client.expire(ts_count_key, 100)
-        
-        # if current_count > 2:
-        #     # Revert: delete stock key and decrement count
-        #     self.redis_cache.client.delete(stock_ts_key)
-        #     self.redis_cache.client.decr(ts_count_key)
-        #     self.logger.info(f"RH: ax trades (2) reached for {final_timestamp}. Skipping.")
+        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, base_payload.stop_loss, base_payload.profit_level, breakout_direction, index_confirmation)
+        # Momentum check
+        # if self.is_invalid_momentum_trade(indicator_values):
+        #     self.logger.info("HN: Invalid momentum indicators. Skipping.")
         #     return
 
         # Check existing open trades
         if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("RH: Max open trades reached. Skipping.")
+            self.logger.info("HN: Max open trades reached. Skipping.")
             # self.redis_cache.client.delete(stock_ts_key)
             # self.redis_cache.client.decr(ts_count_key)
             return
 
         # Check existing open trades
         if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
-            self.logger.info("RH: Max loss trades reached. Skipping.")
+            self.logger.info("HN: Max loss trades reached. Skipping.")
             # self.redis_cache.client.delete(stock_ts_key)
             # self.redis_cache.client.decr(ts_count_key)
             return
         
-        # Place order and log trade
-        rsi, adx, mfi = await asyncio.gather(
-            self.calculate_rsi_talib(stock_data),
-            self.calculate_adx_talib(stock_data),
-            self.calculate_mfi_talib(stock_data)
-        )
-        
-        indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
-        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, sl, pl, breakout_direction)
-        if self.is_invalid_momentum_trade(indicator_values):
-            self.logger.info("RH: Invalid trade based on momentum. Skipping.")
-            return
 
         metadata_json = {
             "atr": atr
         }
 
-        await self.capital_client.place_order(base_payload)
+        deal_reference = await self.capital_client.place_order(base_payload)
         await self.db_con.log_trade_to_db(
             final_stock_data,
             indicator_values,
             broken_level,
-            sl,
-            pl,
+            base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance,
+            base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance,
             breakout_direction,
             stock,
             metadata_json,
             base_payload.quantity,
             order_status=True if self.test_mode else False,
-            order_ids=[],
+            order_ids=[deal_reference] if deal_reference else [],
             stock_ltp=stock_ltp
         )
 
-        self.logger.info(f"RH:  High-probability trade executed for {stock}: ")
+        self.logger.info(f"HN : High-probability trade executed for {stock}: ")
+
 
     async def analyze_sma_strategy(self, stock) -> None:
         stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=HISTORY_DATA_PERIOD), self.end_date)
@@ -1210,9 +1171,9 @@ class StockIndicatorCalculator:
         final_stock_data = stock_data.iloc[-1]
         current_timestamp = stock_data.iloc[-1]['timestamp']
         # Existing checks remain unchanged
-        await self.update_open_trades_status(stock, current_timestamp)        
-        results = await self.db_con.get_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT, total_count=self.TOTAL_TRADES_LIMIT)
-        if any(results):
+        await self.update_open_trades_status(stock_data)        
+        open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
+        if open_results:
             self.logger.info(f"SMA: {stock}: Condition met, skipping trade")
             return
         

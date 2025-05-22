@@ -7,6 +7,7 @@ import asyncpg
 import os
 
 import pandas as pd
+import pytz
 
 from app.analyse.schemas import CapitalMarketDetails, IndicatorValues
 from app.capital.schemas import CapitalTransactionType
@@ -48,6 +49,19 @@ class DBConnection:
         if data:
             return pd.DataFrame(data, columns=['stock', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'ltp'])
         return pd.DataFrame(columns=['stock', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'ltp'])
+
+    async def load_data_from_db_with_timestamp(self, stock: str, start_date: date, timestamp) -> pd.DataFrame:
+        query = """
+            SELECT stock, timestamp, open, high, low, close, volume, open_interest, ltp
+            FROM historical_data
+            WHERE stock = $1 AND DATE(timestamp) >= $2 AND timestamp <= $3
+            ORDER BY timestamp ASC
+        """
+        data = await self.fetch(query, stock, start_date, timestamp)
+        if data:
+            return pd.DataFrame(data, columns=['stock', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'ltp'])
+        return pd.DataFrame(columns=['stock', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'ltp'])
+
 
     async def load_data_for_date_from_db(self, stock: str, date_str: str) -> pd.DataFrame:
         query = """
@@ -247,9 +261,9 @@ class DBConnection:
         Fetch open orders for a stock on a specific date.
         """
         query = """
-        SELECT * FROM order_details WHERE stock = $1 AND status = 'OPEN' AND DATE(timestamp) = $2 AND order_ids IS NOT NULL AND order_ids != '[]'
+        SELECT * FROM order_details WHERE stock = $1 AND status = 'OPEN' AND order_ids IS NOT NULL AND order_ids != '[]'
         """
-        return await self.fetch(query, stock, trade_date)
+        return await self.fetch(query, stock)
 
     async def update_trade_status_by_id(self, executed_trades: list):
         """
@@ -282,10 +296,9 @@ class DBConnection:
             print(f"Postgres syntax error: {e}. Query: {query}")
             raise
 
-
     async def update_trade_statuses(self, executed_trades: list):
         """
-        Update the trade statuses, cp (close price), exit prices, and stock_name in the database.
+        Update the trade statuses, cp (close price), exit prices, stock_name, and order_status in the database.
         """
         if not executed_trades:
             return
@@ -295,35 +308,35 @@ class DBConnection:
         SET 
             status = CASE 
         """
-        # Build the CASE for the status column.
+        # Build the CASE for the status column
         for status, trade_id, cp, exit_price, stock_name in executed_trades:
             query += f"WHEN id = {trade_id} THEN '{status}' "
         query += "END, cp = CASE "
 
-        # Build the CASE for the cp column.
+        # Build the CASE for the cp column
         for status, trade_id, cp, exit_price, stock_name in executed_trades:
             query += f"WHEN id = {trade_id} THEN {cp} "
         query += "END, exit_price = CASE "
 
-        # Build the CASE for the exit_price column.
+        # Build the CASE for the exit_price column
         for status, trade_id, cp, exit_price, stock_name in executed_trades:
             query += f"WHEN id = {trade_id} THEN {exit_price} "
         query += "END, stock_name = CASE "
 
-        # Build the CASE for the stock_name column.
+        # Build the CASE for the stock_name column
         for status, trade_id, cp, exit_price, stock_name in executed_trades:
             query += f"WHEN id = {trade_id} THEN '{stock_name}' "
         query += "END WHERE id IN ({ids});"
 
-        # Replace placeholder with comma-separated list of trade ids.
+        # Replace placeholder with comma-separated list of trade IDs
         ids = ', '.join(str(trade_id) for _, trade_id, _, _, _ in executed_trades)
         query = query.replace("{ids}", ids)
-        
+
         try:
             await self.execute(query)
         except asyncpg.exceptions.UndefinedColumnError as e:
             print(f"Failed to update trade statuses due to undefined column: {e}. Query: {query}")
-            raise  # Re-raise or handle as needed
+            raise
 
     async def check_open_trades_exist(self, stock):
         query = """
@@ -391,6 +404,17 @@ class DBConnection:
             data['open_count'] >= open_count,
             data['total_count'] >= total_count
         )
+
+    async def get_open_trade_stats(self, stock, open_count=2):
+        query = """
+        SELECT 
+            COUNT(*) FILTER (WHERE status = 'OPEN' AND order_ids IS NOT NULL AND order_ids != '[]') as open_count
+        FROM order_details
+        WHERE DATE(timestamp) = $1
+        """
+        data = await self.fetchrow(query, self.end_date)
+
+        return data['open_count'] >= open_count
 
     async def get_daily_trade_analysis(self):
         query = """
@@ -580,3 +604,39 @@ class DBConnection:
                 margin_factor=data[0]['margin_factor']
             )
         return None
+
+    async def save_reversal_data(self, symbol, date, reversal_high, reversal_low, reversal_time, data_type):
+        # ts = ts.tz_localize('UTC').tz_convert('Asia/Kolkata')
+        # ts = ts.tz_localize(None) # Making naive for compatibility with original code
+
+        # First convert to local timezone and make it naive
+        if reversal_time.tzinfo is not None:
+            local_tz = pytz.timezone('Asia/Kolkata')
+            reversal_time = reversal_time.astimezone(local_tz).replace(tzinfo=None)
+
+        query = """
+        INSERT INTO reversal_data (symbol, date, reversal_high, reversal_low, reversal_time, type)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (symbol, date) DO UPDATE SET
+            reversal_high = EXCLUDED.reversal_high,
+            reversal_low = EXCLUDED.reversal_low,
+            reversal_time = EXCLUDED.reversal_time
+        """
+        await self.execute(query, symbol, date, reversal_high, reversal_low, reversal_time, data_type)
+        
+    async def get_reversal_data(self, symbol, date, data_type):
+        query = """
+        SELECT reversal_high, reversal_low, reversal_time
+        FROM reversal_data
+        WHERE symbol = $1 AND date = $2 AND type = $3
+        """
+        row = await self.fetchrow(query, symbol, date, data_type)
+        return (row['reversal_high'], row['reversal_low'], row['reversal_time']) if row else None
+
+    async def check_existing_breakout_today(self, stock, date):
+        query = """
+        SELECT 1 FROM order_details
+        WHERE stock = $1 AND DATE(timestamp) = $2
+        LIMIT 1
+        """
+        return await self.fetchrow(query, stock, date) is not None

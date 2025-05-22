@@ -530,13 +530,31 @@ class CapitalAPI:
 
         positions_list = positions.get("positions", [])
         if not positions_list:
-            print("No positions found.")
-            return None
+            print(f"Position not found for ID: {working_id}")
+            position_status = "CLOSED"
+            profit_loss = 0
+            pl_status = "UNKNOWN"
+            deal_id = None
+            return {
+                "position_status": position_status,
+                "profit_loss_status": pl_status,
+                "profit_loss_amount": profit_loss,
+                "deal_id": deal_id
+            }
         
         position_data = next((p for p in positions_list if p.get("position", {}).get("workingOrderId") == working_id), None)
         if not position_data:
             print(f"Position not found for ID: {working_id}")
-            return None
+            position_status = "CLOSED"
+            profit_loss = 0
+            pl_status = "UNKNOWN"
+            deal_id = None
+            return {
+                "position_status": position_status,
+                "profit_loss_status": pl_status,
+                "profit_loss_amount": profit_loss,
+                "deal_id": deal_id
+            }
         
         position_status = position_data.get("market", {}).get('marketStatus')
         deal_id = position_data.get("position", {}).get("dealId")

@@ -12,28 +12,22 @@ from app.capital.instruments import get_capital_epics, get_epics_for_strategy
 STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "DEFAULT")
 PING_INTERVAL = 15  # WebSocket-level ping interval in seconds
 RECONNECT_DELAY = 3  # Base delay for reconnection attempts in seconds
+INACTIVITY_TIMEOUT = 120  # Reconnect after 2 minutes of no data
 
 class AuthenticationError(Exception):
     """Custom exception for authentication failures"""
     pass
 
-async def process_websocket_message(message: str, producer: PulsarProducer, websocket: websockets.WebSocketClientProtocol):
-    """Processes WebSocket messages and handles protocol-level keep-alives"""
+async def process_websocket_message(message: str, producer: PulsarProducer, websocket: websockets.WebSocketClientProtocol) -> tuple[bool, bool]:
+    """Processes WebSocket messages and returns (reconnect_needed, is_data_message)"""
     try:
         data_dict = json.loads(message)
+        is_data = False
         
         # Handle market data events
         if data_dict.get("destination") == "ohlc.event":
             producer.send_message(json.dumps(data_dict.get("payload", {})))
-        
-        # Handle application-level ping-pong
-        elif data_dict.get("destination") == "ping":
-            timestamp = data_dict.get("payload", {}).get("timestamp")
-            if timestamp is not None:
-                await websocket.send(json.dumps({
-                    "destination": "pong",
-                    "payload": {"timestamp": timestamp}
-                }))
+            is_data = True
         
         # Handle authentication errors
         elif data_dict.get("status") == "error":
@@ -41,18 +35,18 @@ async def process_websocket_message(message: str, producer: PulsarProducer, webs
             if "auth" in error_code or "token" in error_code:
                 raise AuthenticationError(f"Auth error: {data_dict.get('errorMessage')}")
             
-        return False
+        return False, is_data
     
     except json.JSONDecodeError:
         print(f"Failed to decode JSON message: {message[:200]}")
     except AuthenticationError as ae:
         print(f"Authentication failure: {ae}")
         await websocket.close()
-        return True
+        return True, False
     except Exception as e:
         print(f"Error processing message: {str(e)}")
     
-    return False
+    return False, False
 
 async def subscribe_to_epics(websocket, api_client, epics_to_subscribe):
     """Handle batch subscription with error handling"""
@@ -94,29 +88,27 @@ async def subscribe_to_epics(websocket, api_client, epics_to_subscribe):
     
     return True
 
+
 async def capital_websocket_listener(producer: PulsarProducer):
-    """Robust WebSocket listener with enhanced reconnection logic"""
+    """WebSocket listener with inactivity-based reconnection"""
     api_client = CapitalComAPI()
     reconnect_attempts = 0
     ssl_context = ssl.create_default_context()
 
     while True:
         try:
-            # Establish valid session
             if not await api_client.ensure_session_valid():
                 print("Session validation failed")
                 await asyncio.sleep(RECONNECT_DELAY ** reconnect_attempts)
                 reconnect_attempts = min(reconnect_attempts + 1, 5)
                 continue
             
-            # Get current EPICs list
             epics_to_subscribe = get_capital_epics()
             if not epics_to_subscribe:
                 print("No EPICs available for subscription")
                 await asyncio.sleep(60)
                 continue
 
-            # Connect with keep-alive parameters
             async with websockets.connect(
                 api_client.streaming_url,
                 ping_interval=PING_INTERVAL,
@@ -125,27 +117,37 @@ async def capital_websocket_listener(producer: PulsarProducer):
             ) as websocket:
                 
                 print(f"Connected to WebSocket, subscribing to {len(epics_to_subscribe)} instruments")
-                reconnect_attempts = 0  # Reset on successful connection
+                reconnect_attempts = 0  # Reset reconnect attempts
                 
-                # Perform subscription
+                # Perform subscription and reset inactivity timer
                 if not await subscribe_to_epics(websocket, api_client, epics_to_subscribe):
-                    continue  # Reconnect if subscription failed
+                    continue
+                last_data_time = asyncio.get_event_loop().time()
                 
-                # Main message processing loop
+                # Main message loop with inactivity check
                 while True:
                     try:
                         message = await asyncio.wait_for(websocket.recv(), timeout=PING_INTERVAL * 2)
-                        reconnect_needed = await process_websocket_message(message, producer, websocket)
+                        received_time = asyncio.get_event_loop().time()
+                        reconnect_needed, is_data = await process_websocket_message(message, producer, websocket)
+                        if is_data:
+                            last_data_time = received_time
                         if reconnect_needed:
                             break
                     except asyncio.TimeoutError:
-                        # Send keep-alive
                         await websocket.ping()
                         print("Sent WebSocket-level ping")
+                    
+                    # Check inactivity after each operation
+                    current_time = asyncio.get_event_loop().time()
+                    if current_time - last_data_time > INACTIVITY_TIMEOUT:
+                        print(f"No data for {INACTIVITY_TIMEOUT} seconds. Reconnecting...")
+                        await websocket.close()
+                        break
         
         except AuthenticationError as ae:
             print(f"Authentication failed: {ae}")
-            await api_client.reset_session()  # Force new session
+            await api_client.reset_session()
             await asyncio.sleep(RECONNECT_DELAY)
         except (websockets.ConnectionClosed, ConnectionResetError) as e:
             print(f"Connection closed: {str(e)}")
@@ -155,7 +157,3 @@ async def capital_websocket_listener(producer: PulsarProducer):
             print(f"Unexpected error: {str(e)}")
             await asyncio.sleep(RECONNECT_DELAY ** reconnect_attempts)
             reconnect_attempts = min(reconnect_attempts + 1, 5)
-
-# if __name__ == "__main__":
-#     producer = PulsarProducer()  # Initialize your Pulsar producer
-#     asyncio.run(capital_websocket_listener(producer))

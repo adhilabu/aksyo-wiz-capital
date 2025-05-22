@@ -44,6 +44,7 @@ class TradeStatus(str, Enum):
     PROFIT = "PROFIT"
     LOSS = "LOSS"
     OPEN = "OPEN"
+    REJECTED = "REJECTED"
 
 class CapitalMarketDetails:
     def __init__(self, epic: str, min_step_distance: float, 

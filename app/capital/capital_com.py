@@ -1,5 +1,8 @@
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 import httpx
+import pandas as pd
+import pytz
 import websockets
 import json
 import asyncio
@@ -312,6 +315,35 @@ class CapitalComAPI:
         """Get positions with optional status filter."""
         params = {"status": status} if status else {}
         return await self.get("/api/v1/positions", params=params)
+    
+    async def get_activity_history(
+        self,
+        last_period: int = 86400,
+        detailed: bool = True,
+        deal_id: Optional[str] = None,
+        filter: Optional[str] = None
+    ) -> Dict:
+        """
+        Get activity history for a specific period.
+        """
+
+        end_dt_str = datetime.now(pytz.UTC).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
+        start_dt_str = (datetime.now(pytz.UTC) - pd.Timedelta(days=1)).replace(second=0, microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
+
+        params = {
+            # "from": start_dt_str,
+            # "to": end_dt_str,
+            "lastPeriod": last_period,
+            "detailed": detailed
+        }
+        
+        if deal_id:
+            params["dealId"] = deal_id
+        
+        if filter:
+            params["filter"] = filter
+        
+        return await self.get("/api/v1/history/activity", params)
         
     async def create_position(
         self,
