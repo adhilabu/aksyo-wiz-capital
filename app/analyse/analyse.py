@@ -30,7 +30,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 HISTORY_DATA_PERIOD = int(os.getenv("HISTORY_DATA_PERIOD", 100))
 TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION", "False")
-STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 5000)
+STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 10000)
 TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
@@ -1019,8 +1019,8 @@ class StockIndicatorCalculator:
         #     self.logger.info(f"HN :{stock}: Condition met, skipping trade")
         #     return
 
-        results = await self.db_con.get_open_trade_stats(stock, open_count=20)
-        if any(results):
+        open_result = await self.db_con.get_open_trade_stats(stock, open_count=20)
+        if open_result:
             self.logger.info(f"HN :{stock}: Condition met, skipping trade")
             return
 
