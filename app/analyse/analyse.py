@@ -30,7 +30,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 HISTORY_DATA_PERIOD = int(os.getenv("HISTORY_DATA_PERIOD", 100))
 TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION", "False")
-STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 10000)
+STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 5000)
 TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
@@ -915,7 +915,8 @@ class StockIndicatorCalculator:
 
         # Quantity calculation
         # Calculate initial desired quantity based on capital allocation
-        initial_quantity = float(self.stock_per_price_limit / stock_ltp)
+        leverage = self.market_details.get(epic, {}).get('leverage', '1:1')
+        initial_quantity = float(self.stock_per_price_limit / stock_ltp) * float(leverage.split(':')[0])
 
         # Apply min/max constraints and round to the nearest valid increment
         quantity = initial_quantity
@@ -1306,7 +1307,7 @@ class StockIndicatorCalculator:
             stock_ltp=stock_ltp
         )
 
-        self.logger.info(f"SMA: High-probability trade executed for {stock}: Direction {breakout_direction}")
+        self.logger.info(f"SMA: High-probability trade executed for {stock}: Direction {breakout_direction.value}")
 
 
     async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY'):
