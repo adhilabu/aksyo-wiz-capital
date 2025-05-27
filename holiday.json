@@ -5,7 +5,7 @@
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
-        "leverage": "10:1",
+        "leverage": "200:1",
         "orb_enabled": false
     },
     "US100": {
@@ -25,7 +25,7 @@
             "2025-11-27",
             "2025-12-25"
         ],
-        "leverage": "20:1",
+        "leverage": "200:1",
         "sl": "50",
         "pl": "100",
         "qty": "0.2",
@@ -37,7 +37,7 @@
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
-        "leverage": "20:1",
+        "leverage": "200:1",
         "sl": "10",
         "pl": "20",
         "qty": "1",
@@ -74,7 +74,7 @@
             "2025-11-24",
             "2025-12-31"
         ],
-        "leverage": "20:1",
+        "leverage": "200:1",
         "sl": "50",
         "pl": "100",
         "qty": "0.2",
@@ -97,7 +97,7 @@
             "2025-11-27",
             "2025-12-25"
         ],
-        "leverage": "20:1",
+        "leverage": "200:1",
         "sl": "50",
         "pl": "100",
         "qty": "0.2",
@@ -109,7 +109,7 @@
         "timezone": "UTC",
         "weekend_trading": true,
         "holidays": [],
-        "leverage": "2:1",
+        "leverage": "20:1",
         "orb_enabled": false
     },
     "ETHUSD": {
@@ -118,7 +118,7 @@
         "timezone": "UTC",
         "weekend_trading": true,
         "holidays": [],
-        "leverage": "2:1",
+        "leverage": "20:1",
         "orb_enabled": false
     },
     "USCOCOA": {
@@ -127,7 +127,7 @@
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
-        "leverage": "10:1",
+        "leverage": "200:1",
         "sl": "100",
         "pl": "200",
         "qty": "1",
@@ -139,7 +139,7 @@
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
-        "leverage": "30:1",
+        "leverage": "200:1",
         "sl": "0.150",
         "pl": "0.300",
         "qty": "2400",
@@ -151,7 +151,7 @@
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
-        "leverage": "30:1",
+        "leverage": "200:1",
         "orb_enabled": false
     }
 }

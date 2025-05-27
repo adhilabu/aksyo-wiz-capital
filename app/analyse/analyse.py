@@ -30,7 +30,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 HISTORY_DATA_PERIOD = int(os.getenv("HISTORY_DATA_PERIOD", 100))
 TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION", "False")
-STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 5000)
+STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 1000)
 TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
@@ -916,8 +916,10 @@ class StockIndicatorCalculator:
         # Quantity calculation
         # Calculate initial desired quantity based on capital allocation
         leverage = self.market_details.get(epic, {}).get('leverage', '1:1')
-        initial_quantity = float(self.stock_per_price_limit / stock_ltp) * float(leverage.split(':')[0])
-
+        initial_quantity = float(self.stock_per_price_limit / stock_ltp)
+        if initial_quantity <= 0:
+            self.logger.warning(f"Calculated quantity is zero or negative for {epic} at LTP {stock_ltp}. Skipping order.")
+            return None
         # Apply min/max constraints and round to the nearest valid increment
         quantity = initial_quantity
 
@@ -1045,7 +1047,8 @@ class StockIndicatorCalculator:
         ]
         
         current_price = final_stock_data['ltp']
-        breakout_direction = None
+        breakout_direction = CapitalTransactionType.BUY
+        broken_level = reversal_high
         
         if current_price > reversal_high:
             breakout_direction = CapitalTransactionType.BUY

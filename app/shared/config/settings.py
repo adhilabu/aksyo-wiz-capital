@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     UI_INSTRUMENTS: str = "OIL_CRUDE,US100,GOLD,J225,US30,BTCUSD"
     TRADE_ANALYSIS_TYPE: TradeAnalysisType = TradeAnalysisType.NORMAL
     PULSAR_TOPIC: str = 'capital-topic'
+    STOCK_PER_PRICE_LIMIT: int = 1000
 
     class Config:
         env_file = ".env"
