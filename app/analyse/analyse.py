@@ -34,10 +34,15 @@ STOCK_PER_PRICE_LIMIT = os.getenv("STOCK_PER_PRICE_LIMIT", 1000)
 TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
+TRADE_PERC = float(os.getenv("TRADE_PERC", 0.006))
+TP_PERC = float(os.getenv("TP_PERC", 0.007))
+SL_PERC = float(os.getenv("SL_PERC", 0.0051))
 
 class StockIndicatorCalculator:
     TICK_SIZE = 0.01
-    TRADE_PERC = 0.006
+    TRADE_PERC = TRADE_PERC
+    TP_PERC = TP_PERC
+    SL_PERC = SL_PERC
     MAX_ADJUSTMENTS = 3
     TOTAL_TRADES_LIMIT = 30
     OPEN_TRADES_LIMIT = 15
@@ -124,6 +129,10 @@ class StockIndicatorCalculator:
 
         if TRADE_ANALYSIS_TYPE == TradeAnalysisType.NORMAL:
             await self.analyze_sma_strategy(stock)
+            return
+        
+        if TRADE_ANALYSIS_TYPE == TradeAnalysisType.MACD:
+            await self.analyze_sma_macd_crossover_strategy(stock)
             return
 
         await self.analyze_reversal_breakout_strategy(stock, timestamp)
@@ -782,7 +791,8 @@ class StockIndicatorCalculator:
             max_distance = details.max_stop_or_profit_distance
 
         # 3. Base SL based on strategy percentage
-        sl_pct = self.TRADE_PERC
+        # sl_pct = self.TRADE_PERC
+        sl_pct = self.SL_PERC
         if direction == CapitalTransactionType.BUY:
             desired_sl = entry_price * (1 - sl_pct)
         else:
@@ -859,7 +869,8 @@ class StockIndicatorCalculator:
 
         # 3. Strategy: calculate risk and reward (1:2 RR)
         risk = abs(entry_price - stop_loss)
-        reward = risk * 1.2  # for 1:2 RR
+        # reward = risk * 1.2  # for 1:2 RR
+        reward = risk * self.TP_PERC
 
         if direction == CapitalTransactionType.BUY:
             desired_pl = entry_price + reward
@@ -1312,6 +1323,197 @@ class StockIndicatorCalculator:
 
         self.logger.info(f"SMA: High-probability trade executed for {stock}: Direction {breakout_direction.value}")
 
+    async def analyze_sma_macd_crossover_strategy(self, stock) -> None:
+        """
+        Implements RSI + MACD crossover strategy on 15-minute timeframes.
+        Entry conditions:
+        Long: RSI < 30 (oversold) + MACD crosses above Signal
+        Short: RSI > 70 (overbought) + MACD crosses below Signal
+        """
+        # Load historical data for the past 5 days to ensure enough data for calculations
+        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(
+            stock, 
+            self.end_date - timedelta(days=5), 
+            self.end_date
+        )
+
+        # sort by timestamp
+        if stock_data.empty:
+            return
+
+        # Sort data by timestamp
+        stock_data = stock_data.sort_values(by='timestamp', ascending=True)
+        final_stock_data = stock_data.iloc[-1]
+        current_timestamp = final_stock_data['timestamp']
+
+        # continue if current_timestamp + 1 is not in the multiple of 15 minutes
+        if (current_timestamp + timedelta(minutes=1)).minute % 15 != 0:
+            return
+
+        # Update existing trades and check limits
+        await self.update_open_trades_status(stock_data)
+        open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
+        if open_results:
+            self.logger.info(f"MACD: {stock}: Max open trades reached, skipping")
+            return
+
+        # Transform 1-minute data to 15-minute timeframe
+        stock_data_15min = await self.transform_data_to_15min(stock, stock_data)
+        if len(stock_data_15min) < 35:  # Need enough data for indicators
+            return
+
+        # Calculate RSI
+        rsi = talib.RSI(stock_data_15min['close'].values, timeperiod=14)
+        
+        # Calculate MACD
+        macd, signal, hist = talib.MACD(
+            stock_data_15min['close'].values,
+            fastperiod=12,
+            slowperiod=26,
+            signalperiod=9
+        )
+
+        # Get current and previous values
+        current_rsi = rsi[-1]
+        prev_rsi = rsi[-2]
+        current_macd = macd[-1]
+        current_signal = signal[-1]
+        prev_macd = macd[-2]
+        prev_signal = signal[-2]
+
+        # Determine trade direction based on conditions
+        breakout_direction = None
+        if (current_rsi < 30 and prev_rsi < 30 and 
+            current_macd > current_signal and prev_macd <= prev_signal):
+            breakout_direction = CapitalTransactionType.BUY
+        elif (current_rsi > 70 and prev_rsi > 70 and 
+              current_macd < current_signal and prev_macd >= prev_signal):
+            breakout_direction = CapitalTransactionType.SELL
+        else:
+            return
+
+        # Get current price and prepare order
+        current_price = final_stock_data['ltp']
+        stock_ltp = await self.get_stock_ltp(stock, current_price)
+
+        # Custom take profit and stop loss percentages
+        # tp_percentage = 0.0007  # 0.07%
+        # sl_percentage = 0.00051  # 0.051%
+
+        # # Calculate take profit and stop loss levels
+        # if breakout_direction == CapitalTransactionType.BUY:
+        #     take_profit = stock_ltp * (1 + tp_percentage)
+        #     stop_loss = stock_ltp * (1 - sl_percentage)
+        # else:
+        #     take_profit = stock_ltp * (1 - tp_percentage)
+        #     stop_loss = stock_ltp * (1 + sl_percentage)
+
+        # Prepare order payload with custom TP/SL
+        base_payload = await self.get_base_payload_for_capital_order(
+            epic=stock,
+            stock_ltp=stock_ltp,
+            trans_type=breakout_direction,
+            order_type=CapitalOrderType.MARKET,
+            timestamp=current_timestamp,
+            stock_data=stock_data
+        )
+        
+        if not base_payload:
+            return
+
+        # Override the default SL/TP with our strategy-specific values
+        # base_payload.stop_loss = stop_loss
+        # base_payload.profit_level = take_profit
+        # base_payload.stop_distance = abs(stock_ltp - stop_loss)
+        # base_payload.profit_distance = abs(stock_ltp - take_profit)
+
+        # Add random delay to prevent simultaneous orders
+        await asyncio.sleep(random.uniform(0, 1))
+
+        # Redis key for stock timestamp validation
+        stock_ts_key = f"order:{stock}:{current_timestamp}"
+        if not self.redis_cache.client.setnx(stock_ts_key, 1):
+            return
+        self.redis_cache.client.expire(stock_ts_key, 30)
+
+        # Final checks before placing order
+        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+            self.logger.info("MACD: Max open trades reached. Skipping.")
+            return
+
+        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+            self.logger.info("MACD: Max loss trades reached. Skipping.")
+            return
+
+        # Prepare indicator values for logging
+        indicator_values = IndicatorValues(
+            rsi=current_rsi,
+            adx=0,  # Not used in this strategy
+            mfi=0   # Not used in this strategy
+        )
+
+        # Send notification
+        await self.send_telegram_notification(
+            final_stock_data,
+            indicator_values,
+            current_price,  # Using current price as broken level
+            base_payload.stop_loss,
+            base_payload.profit_level,
+            breakout_direction
+        )
+
+        # Prepare metadata
+        metadata_json = {
+            "rsi": current_rsi,
+            "macd": current_macd,
+            "macd_signal": current_signal,
+            "strategy": "RSI_MACD_CROSS"
+        }
+
+        # Place order and log trade
+        deal_reference = await self.capital_client.place_order(base_payload)
+        await self.db_con.log_trade_to_db(
+            final_stock_data,
+            indicator_values,
+            current_price,  # Using current price as broken level
+            base_payload.stop_loss,
+            base_payload.profit_level,
+            breakout_direction,
+            stock,
+            metadata_json,
+            base_payload.quantity,
+            order_status=True if self.test_mode else False,
+            order_ids=[deal_reference] if deal_reference else [],
+            stock_ltp=stock_ltp
+        )
+
+        self.logger.info(
+            f"MACD: Trade executed for {stock}: Direction {breakout_direction.value}, "
+            f"RSI: {current_rsi:.2f}, MACD Cross: {current_macd:.6f}/{current_signal:.6f}"
+        )
+
+    async def transform_data_to_15min(self, stock: str, in_data: pd.DataFrame) -> pd.DataFrame:
+        """Transform 1-minute data to 15-minute timeframe."""
+        data = in_data.copy()
+        if data.empty:
+            return data
+        
+        data['timestamp'] = pd.to_datetime(data['timestamp'])
+        data['timestamp'] = data['timestamp'].dt.tz_localize(None)
+        data['timestamp'] = data['timestamp'].dt.floor('15min')
+        
+        data = data.groupby(['stock', pd.Grouper(key='timestamp', freq='15min')]).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+            'open_interest': 'last',
+            'ltp': 'last'
+        }).reset_index()
+        
+        data['stock'] = stock
+        return data
 
     async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY'):
         stock = stock_data['stock']
