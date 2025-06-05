@@ -926,8 +926,17 @@ class StockIndicatorCalculator:
 
         # Quantity calculation
         # Calculate initial desired quantity based on capital allocation
-        leverage = self.market_details.get(epic, {}).get('leverage', '1:1')
-        initial_quantity = float(self.stock_per_price_limit / stock_ltp)
+        raw_leverage = self.market_details.get(epic, {}).get('leverage', '1:1')
+        try:
+            leverage_factor = float(raw_leverage.split(":")[1])
+        except Exception:
+            self.logger.warning(f"Malformed leverage '{raw_leverage}' for {epic}, defaulting to 1:1")
+            leverage_factor = 1.0
+            
+        stock_per_price = self.stock_per_price_limit
+        if leverage_factor < 100:
+            stock_per_price = stock_per_price / 2
+        initial_quantity = float(stock_per_price / stock_ltp)
         if initial_quantity <= 0:
             self.logger.warning(f"Calculated quantity is zero or negative for {epic} at LTP {stock_ltp}. Skipping order.")
             return None
@@ -1021,9 +1030,9 @@ class StockIndicatorCalculator:
         # Existing checks remain unchanged
         # await self.check_and_execute_exit_trade_type_2(final_stock_data)
         await self.update_open_trades_status(stock_data)
-        # if stock in self.executed_breakouts and self.executed_breakouts[stock]:
-        #     self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
-        #     return
+        if stock in self.executed_breakouts and self.executed_breakouts[stock]:
+            self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
+            return
     
         if (final_timestamp.minute + 1) % 5 != 0:
             return
@@ -1099,7 +1108,7 @@ class StockIndicatorCalculator:
         
 
         # Calculate dynamic position size based on volatility
-        atr = await self.calculate_atr(stock_data_5_min)
+        atr = 0
         
         # In analyze_reversal_breakout_strategy:
         # Determine SL and PL based on breakout direction
@@ -1135,7 +1144,17 @@ class StockIndicatorCalculator:
 
         await asyncio.sleep(random.uniform(0, 1))
 
-        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, base_payload.stop_loss, base_payload.profit_level, breakout_direction, index_confirmation)
+        # Redis key for stock timestamp validation
+        stock_ts_key = f"order:{stock}:{current_timestamp}"
+
+        # Check if this stock timestamp combination already exists
+        if not self.redis_cache.client.setnx(stock_ts_key, 1):
+            return  # Exit if key already exists
+
+        # Set TTL for the stock timestamp key (100 seconds)
+        self.redis_cache.client.expire(stock_ts_key, 30)
+
+        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, base_payload.stop_loss, base_payload.profit_level, breakout_direction)
         # Momentum check
         # if self.is_invalid_momentum_trade(indicator_values):
         #     self.logger.info("HN: Invalid momentum indicators. Skipping.")
@@ -1171,7 +1190,7 @@ class StockIndicatorCalculator:
             stock,
             metadata_json,
             base_payload.quantity,
-            order_status=True if self.test_mode else False,
+            order_status=True,
             order_ids=[deal_reference] if deal_reference else [],
             stock_ltp=stock_ltp
         )
