@@ -2,6 +2,7 @@ import asyncio
 import os
 from fastapi import FastAPI
 from app.capital.feed import capital_websocket_listener
+from app.notification.telegram import TelegramAPI
 from app.pulsar.consumer import PulsarConsumer, initialize_shared_data
 from app.pulsar.producer import PulsarProducer
 import traceback
@@ -16,6 +17,22 @@ PULSAR_TOPIC = f"{base_topic}-{split_type}"
 CONSUMER_COUNT = int(os.getenv("CONSUMER_THREAD_COUNT", 6))  # Renamed to better reflect usage
 
 pulsar_producer = PulsarProducer(PULSAR_URL, PULSAR_TOPIC)
+
+TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION", "false")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+message = (
+    f"Aksyo - Capital Strategy strarted with the following configuration:\n"
+    f"- Pulsar URL: {PULSAR_URL}\n"
+    f"- Pulsar Topic: {PULSAR_TOPIC}\n"
+    f"- Split Type: {split_type}\n"
+)
+
+if TELEGRAM_NOTIFICATION.lower() == "true":
+    telegram_api = TelegramAPI(TELEGRAM_TOKEN)
+    telegram_api.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
 
 async def lifespan(app: FastAPI):
