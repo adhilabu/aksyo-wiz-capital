@@ -38,6 +38,9 @@ TRADE_PERC = float(os.getenv("TRADE_PERC", 0.006))
 TP_PERC = float(os.getenv("TP_PERC", 0.007))
 SL_PERC = float(os.getenv("SL_PERC", 0.0051))
 
+print(f"Trade Analysis Type: {TRADE_ANALYSIS_TYPE}")
+
+
 class StockIndicatorCalculator:
     TICK_SIZE = 0.01
     TRADE_PERC = TRADE_PERC
@@ -1409,6 +1412,7 @@ class StockIndicatorCalculator:
               current_macd < current_signal and prev_macd >= prev_signal):
             breakout_direction = CapitalTransactionType.SELL
         else:
+            self.logger.info(f"MACD: {stock}: No valid crossover conditions met. Skipping.")
             return
 
         # Get current price and prepare order
