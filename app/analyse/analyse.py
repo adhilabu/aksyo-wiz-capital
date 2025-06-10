@@ -36,7 +36,7 @@ NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 TRADE_PERC = float(os.getenv("TRADE_PERC", 0.006))
 TP_PERC = float(os.getenv("TP_PERC", 0.007))
-SL_PERC = float(os.getenv("SL_PERC", 0.0051))
+SL_PERC = float(os.getenv("SL_PERC", 0.006))
 
 print(f"Trade Analysis Type: {TRADE_ANALYSIS_TYPE}")
 
@@ -840,7 +840,14 @@ class StockIndicatorCalculator:
             else:
                 grn_min = details.min_guaranteed_stop_distance
             if current_distance < grn_min:
-                desired_sl = entry_price - grn_min if direction == CapitalTransactionType.BUY else entry_price + grn_min
+                adjustment = grn_min * 1.01
+                self.logger.warning(f"SL distance {current_distance:.4f} < GRN min {grn_min:.4f}, adjusting to GRN.")
+                # Adjust SL based on direction
+                if direction == CapitalTransactionType.BUY:
+                    desired_sl = entry_price - adjustment if desired_sl > entry_price else entry_price + adjustment
+                else:
+                    desired_sl = entry_price + adjustment if desired_sl < entry_price else entry_price - adjustment
+                current_distance = abs(entry_price - desired_sl)
 
         # 7. Round to valid increment
         round_up = (direction == CapitalTransactionType.SELL)
@@ -886,14 +893,28 @@ class StockIndicatorCalculator:
             self.logger.warning(
                 f"PL distance {current_distance:.4f} < API min {min_distance:.4f}, adjusting to min."
             )
-            desired_pl = entry_price + min_distance if direction == CapitalTransactionType.BUY else entry_price - min_distance
+            adjustment = min_distance * 1.01
+            # Adjust PL based on direction
+            if direction == CapitalTransactionType.BUY:
+                desired_pl = entry_price + adjustment
+            else:
+                desired_pl = entry_price - adjustment
+            # Recalculate current distance
             current_distance = abs(entry_price - desired_pl)
+
         elif current_distance > max_distance:
             self.logger.warning(
                 f"PL distance {current_distance:.4f} > API max {max_distance:.4f}, adjusting to max."
             )
-            desired_pl = entry_price + max_distance if direction == CapitalTransactionType.BUY else entry_price - max_distance
+            adjustment = max_distance * 0.99
+            # Adjust PL based on direction
+            if direction == CapitalTransactionType.BUY:
+                desired_pl = entry_price + adjustment
+            else:
+                desired_pl = entry_price - adjustment
+            # Recalculate current distance
             current_distance = abs(entry_price - desired_pl)
+
 
         # 5. Round to valid increment
         round_up = direction == CapitalTransactionType.BUY
@@ -1045,10 +1066,10 @@ class StockIndicatorCalculator:
         #     self.logger.info(f"HN :{stock}: Condition met, skipping trade")
         #     return
 
-        open_result = await self.db_con.get_open_trade_stats(stock, open_count=20)
-        if open_result:
-            self.logger.info(f"HN :{stock}: Condition met, skipping trade")
-            return
+        # open_result = await self.db_con.get_open_trade_stats(stock, open_count=20)
+        # if open_result:
+        #     self.logger.info(f"HN :{stock}: Condition met, skipping trade")
+        #     return
 
         # Existing data processing remains unchanged
         stock_data_5_min = await self.transform_1_min_data_to_5_min_data(stock, stock_data)
@@ -1164,18 +1185,18 @@ class StockIndicatorCalculator:
         #     return
 
         # Check existing open trades
-        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("HN: Max open trades reached. Skipping.")
-            # self.redis_cache.client.delete(stock_ts_key)
-            # self.redis_cache.client.decr(ts_count_key)
-            return
+        # if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+        #     self.logger.info("HN: Max open trades reached. Skipping.")
+        #     # self.redis_cache.client.delete(stock_ts_key)
+        #     # self.redis_cache.client.decr(ts_count_key)
+        #     return
 
-        # Check existing open trades
-        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
-            self.logger.info("HN: Max loss trades reached. Skipping.")
-            # self.redis_cache.client.delete(stock_ts_key)
-            # self.redis_cache.client.decr(ts_count_key)
-            return
+        # # Check existing open trades
+        # if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+        #     self.logger.info("HN: Max loss trades reached. Skipping.")
+        #     # self.redis_cache.client.delete(stock_ts_key)
+        #     # self.redis_cache.client.decr(ts_count_key)
+        #     return
         
 
         metadata_json = {
@@ -1212,10 +1233,10 @@ class StockIndicatorCalculator:
         current_timestamp = stock_data.iloc[-1]['timestamp']
         # Existing checks remain unchanged
         await self.update_open_trades_status(stock_data)        
-        open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
-        if open_results:
-            self.logger.info(f"SMA: {stock}: Condition met, skipping trade")
-            return
+        # open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
+        # if open_results:
+        #     self.logger.info(f"SMA: {stock}: Condition met, skipping trade")
+        #     return
         
         current_price = final_stock_data['ltp']
         breakout_direction = None
@@ -1295,13 +1316,13 @@ class StockIndicatorCalculator:
         self.redis_cache.client.expire(stock_ts_key, 30)
 
         # Check open trade limits
-        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("SMA: Max open trades reached. Skipping.")
-            return
+        # if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+        #     self.logger.info("SMA: Max open trades reached. Skipping.")
+        #     return
 
-        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
-            self.logger.info("SMA: Max loss trades reached. Skipping.")
-            return
+        # if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+        #     self.logger.info("SMA: Max loss trades reached. Skipping.")
+        #     return
         
         # Calculate momentum indicators
         rsi, adx, mfi = await asyncio.gather(
@@ -1374,10 +1395,10 @@ class StockIndicatorCalculator:
 
         # Update existing trades and check limits
         await self.update_open_trades_status(stock_data)
-        open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
-        if open_results:
-            self.logger.info(f"MACD: {stock}: Max open trades reached, skipping")
-            return
+        # open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
+        # if open_results:
+        #     self.logger.info(f"MACD: {stock}: Max open trades reached, skipping")
+        #     return
 
         # Transform 1-minute data to 15-minute timeframe
         stock_data_15min = await self.transform_data_to_15min(stock, stock_data)
@@ -1460,13 +1481,13 @@ class StockIndicatorCalculator:
         self.redis_cache.client.expire(stock_ts_key, 30)
 
         # Final checks before placing order
-        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("MACD: Max open trades reached. Skipping.")
-            return
+        # if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+        #     self.logger.info("MACD: Max open trades reached. Skipping.")
+        #     return
 
-        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
-            self.logger.info("MACD: Max loss trades reached. Skipping.")
-            return
+        # if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+        #     self.logger.info("MACD: Max loss trades reached. Skipping.")
+        #     return
 
         # Prepare indicator values for logging
         indicator_values = IndicatorValues(

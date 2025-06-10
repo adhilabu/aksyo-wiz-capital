@@ -1,5 +1,12 @@
 from datetime import datetime
 import logging
+import os
+
+from app.analyse.schemas import TradeAnalysisType
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=".env", override=True)
+
+TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 
 def setup_logger(name: str, log_file: str, level=logging.INFO):
     """
@@ -19,7 +26,11 @@ def setup_logger(name: str, log_file: str, level=logging.INFO):
 
     # Create a file handler for logging to a file
     date_str = datetime.now().strftime("%Y-%m-%d")
-    log_path = f"logs/{log_file}_{date_str}.log"
+
+    if os.path.exists("logs") is False:
+        os.makedirs("logs")
+
+    log_path = f"logs/{log_file}_{date_str}_{TRADE_ANALYSIS_TYPE}.log"
     file_handler = logging.FileHandler(log_path)
     file_handler.setLevel(level)
 

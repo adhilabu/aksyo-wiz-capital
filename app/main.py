@@ -1,5 +1,6 @@
 import asyncio
 import os
+from app.analyse.schemas import TradeAnalysisType
 from fastapi import FastAPI
 from app.capital.feed import capital_websocket_listener
 from app.notification.telegram import TelegramAPI
@@ -17,6 +18,7 @@ PULSAR_TOPIC = f"{base_topic}-{split_type}"
 CONSUMER_COUNT = int(os.getenv("CONSUMER_THREAD_COUNT", 6))  # Renamed to better reflect usage
 
 pulsar_producer = PulsarProducer(PULSAR_URL, PULSAR_TOPIC)
+TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 
 TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION", "false")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -28,6 +30,8 @@ message = (
     f"- Pulsar URL: {PULSAR_URL}\n"
     f"- Pulsar Topic: {PULSAR_TOPIC}\n"
     f"- Split Type: {split_type}\n"
+    f"- Consumer Count: {CONSUMER_COUNT}\n"
+    f"- Trade Analysis Type: {TRADE_ANALYSIS_TYPE}\n"
 )
 
 if TELEGRAM_NOTIFICATION.lower() == "true":

@@ -26,3 +26,5 @@ trade_analysis.txt
 run_migrations.py
 trade_analysis.txt
 fno_instruments_cache.pkl
+venv_dp/bin_d/python
+venv_dp/bin_d/python3.12
