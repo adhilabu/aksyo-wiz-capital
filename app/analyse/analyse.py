@@ -35,8 +35,7 @@ TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE", TradeAnalysisType.NORMAL)
 NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 TRADE_PERC = float(os.getenv("TRADE_PERC", 0.006))
-TP_PERC = float(os.getenv("TP_PERC", 0.007))
-SL_PERC = float(os.getenv("SL_PERC", 0.006))
+SL_PERC = float(os.getenv("SL_PERC", 0.0025))
 
 print(f"Trade Analysis Type: {TRADE_ANALYSIS_TYPE}")
 
@@ -44,7 +43,6 @@ print(f"Trade Analysis Type: {TRADE_ANALYSIS_TYPE}")
 class StockIndicatorCalculator:
     TICK_SIZE = 0.01
     TRADE_PERC = TRADE_PERC
-    TP_PERC = TP_PERC
     SL_PERC = SL_PERC
     MAX_ADJUSTMENTS = 3
     TOTAL_TRADES_LIMIT = 30
@@ -130,15 +128,20 @@ class StockIndicatorCalculator:
         self.logger.info(f"Inserting data for stock: {stock} and timestamp: {timestamp}.")
         await self.db_con.save_data_to_db(data.to_frame().T)
 
-        if TRADE_ANALYSIS_TYPE == TradeAnalysisType.NORMAL:
-            await self.analyze_sma_strategy(stock)
-            return
+        # if TRADE_ANALYSIS_TYPE == TradeAnalysisType.NORMAL:
+        #     await self.analyze_sma_strategy(stock)
+        #     return
         
-        if TRADE_ANALYSIS_TYPE == TradeAnalysisType.MACD:
-            await self.analyze_sma_macd_crossover_strategy(stock)
-            return
+        # if TRADE_ANALYSIS_TYPE == TradeAnalysisType.MACD:
+        #     await self.analyze_sma_macd_crossover_strategy(stock)
+        #     return
 
-        await self.analyze_reversal_breakout_strategy(stock, timestamp)
+        # await self.analyze_reversal_breakout_strategy(stock, timestamp)
+        await asyncio.gather(
+            self.analyze_sma_strategy(stock),
+            self.analyze_sma_macd_crossover_strategy(stock),
+            self.analyze_reversal_breakout_strategy(stock, timestamp)
+        )
     
 
     async def get_stock_ltp(self, stock, current_price):
@@ -877,11 +880,8 @@ class StockIndicatorCalculator:
         min_distance = to_abs(details.min_stop_or_profit_distance, details.min_stop_or_profit_distance_unit)
         max_distance = to_abs(details.max_stop_or_profit_distance, details.max_stop_or_profit_distance_unit)
 
-        # 3. Strategy: calculate risk and reward (1:2 RR)
         risk = abs(entry_price - stop_loss)
-        # reward = risk * 1.2  # for 1:2 RR
-        reward = risk * self.TP_PERC
-
+        reward = risk * 1.5  # Default 1:1.5 risk-reward ratio
         if direction == CapitalTransactionType.BUY:
             desired_pl = entry_price + reward
         else:
