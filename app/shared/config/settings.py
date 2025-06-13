@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     TRADE_ANALYSIS_TYPE: TradeAnalysisType = TradeAnalysisType.NORMAL
     PULSAR_TOPIC: str = 'capital-topic'
     STOCK_PER_PRICE_LIMIT: int = 1000
+    SL_PERC: float = 0.004  # 1% stop loss
 
     class Config:
         env_file = ".env"
