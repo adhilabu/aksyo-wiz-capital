@@ -138,7 +138,7 @@ class StockIndicatorCalculator:
 
         # await self.analyze_reversal_breakout_strategy(stock, timestamp)
         await asyncio.gather(
-            self.analyze_sma_strategy(stock),
+            # self.analyze_sma_strategy(stock),
             self.analyze_sma_macd_crossover_strategy(stock),
             self.analyze_reversal_breakout_strategy(stock, timestamp)
         )
@@ -827,12 +827,12 @@ class StockIndicatorCalculator:
         current_distance = abs(entry_price - desired_sl)
         if current_distance < min_distance:
             self.logger.warning(f"SL distance {current_distance:.4f} < min {min_distance:.4f}, adjusting.")
-            adj = min_distance * 1.01
+            adj = min_distance * 1.001
             desired_sl = entry_price - adj if direction == CapitalTransactionType.BUY else entry_price + adj
             current_distance = abs(entry_price - desired_sl)
         if current_distance > max_distance:
             self.logger.warning(f"SL distance {current_distance:.4f} > max {max_distance:.4f}, adjusting.")
-            adj = max_distance * 0.99
+            adj = max_distance * 0.999
             desired_sl = entry_price - adj if direction == CapitalTransactionType.BUY else entry_price + adj
             current_distance = abs(entry_price - desired_sl)
 
@@ -843,7 +843,7 @@ class StockIndicatorCalculator:
             else:
                 grn_min = details.min_guaranteed_stop_distance
             if current_distance < grn_min:
-                adjustment = grn_min * 1.01
+                adjustment = grn_min * 1.001
                 self.logger.warning(f"SL distance {current_distance:.4f} < GRN min {grn_min:.4f}, adjusting to GRN.")
                 # Adjust SL based on direction
                 if direction == CapitalTransactionType.BUY:
