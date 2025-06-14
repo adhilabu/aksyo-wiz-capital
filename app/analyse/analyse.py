@@ -1332,7 +1332,7 @@ class StockIndicatorCalculator:
             self.logger.info(f"SMA: {stock}: Insufficient data to calculate SMAs. Skipping.")
             return
 
-        breakout_direction = CapitalTransactionType.BUY
+        breakout_direction = None
         broken_level = sma13
 
         if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13 and prev_high_2 < prev_sma13_2 and prev_high_3 < prev_sma13_3:
@@ -1530,11 +1530,6 @@ class StockIndicatorCalculator:
         if not base_payload:
             return
 
-        # Override the default SL/TP with our strategy-specific values
-        # base_payload.stop_loss = stop_loss
-        # base_payload.profit_level = take_profit
-        # base_payload.stop_distance = abs(stock_ltp - stop_loss)
-        # base_payload.profit_distance = abs(stock_ltp - take_profit)
 
         # Add random delay to prevent simultaneous orders
         await asyncio.sleep(random.uniform(0, 1))
@@ -1856,16 +1851,15 @@ class StockIndicatorCalculator:
         mean = pd.Series(closes).rolling(20).mean().iloc[-1]
         std = pd.Series(closes).rolling(20).std().iloc[-1]
         z = (closes[-1] - mean) / std if std>0 else 0
-
         cur_price = df['ltp'].iloc[-1]
-        # pip = symbol.pip_to_price(1)
-        direction = CapitalTransactionType.BUY
+
+        direction = None
         if rsi[-1] < 30 and cur_price <= lower[-1] and z <= -1.5:
             direction = CapitalTransactionType.BUY
         elif rsi[-1] > 70 and cur_price >= upper[-1] and z >= 1.5:
             direction = CapitalTransactionType.SELL
-        # else:
-        #     return
+        else:
+            return
 
         entry = cur_price
 
@@ -1884,6 +1878,7 @@ class StockIndicatorCalculator:
         key = f"mr:{symbol}:{now}"
         if not self.redis_cache.client.setnx(key,1):
             return
+        
         self.redis_cache.client.expire(key,30)
 
         indicator_values = IndicatorValues(rsi=0, adx=0, mfi=0)
