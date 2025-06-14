@@ -479,7 +479,7 @@ class CapitalAPI:
             margin_factor=snapshot.get('scalingFactor')
         )
 
-        # Save to database
+        # Save to database with ON CONFLICT DO UPDATE
         await self.db_conn.execute(
             """
             INSERT INTO capital_market_details 
@@ -490,6 +490,23 @@ class CapitalAPI:
             min_stop_or_profit_distance_unit, max_stop_or_profit_distance,
             max_stop_or_profit_distance_unit, decimal_places, margin_factor)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            ON CONFLICT (epic) DO UPDATE SET
+                min_step_distance = EXCLUDED.min_step_distance,
+                min_step_distance_unit = EXCLUDED.min_step_distance_unit,
+                min_deal_size = EXCLUDED.min_deal_size,
+                min_deal_size_unit = EXCLUDED.min_deal_size_unit,
+                max_deal_size = EXCLUDED.max_deal_size,
+                max_deal_size_unit = EXCLUDED.max_deal_size_unit,
+                min_size_increment = EXCLUDED.min_size_increment,
+                min_size_increment_unit = EXCLUDED.min_size_increment_unit,
+                min_guaranteed_stop_distance = EXCLUDED.min_guaranteed_stop_distance,
+                min_guaranteed_stop_distance_unit = EXCLUDED.min_guaranteed_stop_distance_unit,
+                min_stop_or_profit_distance = EXCLUDED.min_stop_or_profit_distance,
+                min_stop_or_profit_distance_unit = EXCLUDED.min_stop_or_profit_distance_unit,
+                max_stop_or_profit_distance = EXCLUDED.max_stop_or_profit_distance,
+                max_stop_or_profit_distance_unit = EXCLUDED.max_stop_or_profit_distance_unit,
+                decimal_places = EXCLUDED.decimal_places,
+                margin_factor = EXCLUDED.margin_factor
             """,
             capital_market_details.epic,
             capital_market_details.min_step_distance,

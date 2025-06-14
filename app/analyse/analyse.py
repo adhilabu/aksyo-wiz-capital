@@ -36,6 +36,7 @@ NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 TRADE_PERC = float(os.getenv("TRADE_PERC", 0.006))
 SL_PERC = float(os.getenv("SL_PERC", 0.0025))
+LOG_TRADE_TO_DB = os.getenv("LOG_TRADE_TO_DB", "False").lower() == "true"
 
 print(f"Trade Analysis Type: {TRADE_ANALYSIS_TYPE}")
 
@@ -128,19 +129,13 @@ class StockIndicatorCalculator:
         self.logger.info(f"Inserting data for stock: {stock} and timestamp: {timestamp}.")
         await self.db_con.save_data_to_db(data.to_frame().T)
 
-        # if TRADE_ANALYSIS_TYPE == TradeAnalysisType.NORMAL:
-        #     await self.analyze_sma_strategy(stock)
-        #     return
-        
-        # if TRADE_ANALYSIS_TYPE == TradeAnalysisType.MACD:
-        #     await self.analyze_sma_macd_crossover_strategy(stock)
-        #     return
-
-        # await self.analyze_reversal_breakout_strategy(stock, timestamp)
         await asyncio.gather(
-            # self.analyze_sma_strategy(stock),
-            self.analyze_sma_macd_crossover_strategy(stock),
-            self.analyze_reversal_breakout_strategy(stock, timestamp)
+            self.analyze_mean_reversion_strategy(stock),
+            self.analyze_ma_crossover_strategy_type_2(stock),
+            self.analyze_sma_strategy_type_2(stock),
+            self.analyze_sma_macd_crossover_strategy(stock, timestamp),
+            self.analyze_reversal_breakout_strategy(stock, timestamp),
+            self.analyze_sma_strategy_type_1(stock),
         )
     
 
@@ -202,78 +197,144 @@ class StockIndicatorCalculator:
     async def process_historical_combined_stock_data(self):
         for stock in self.epics:
             market_config = self.market_details.get(stock, {})
+            if not market_config:
+                self.logger.warning(f"No market configuration found for {stock}, skipping...")
+                continue
+
             days_checked = 0
             current_date = datetime.now(pytz.UTC)
+            max_retries = 3
+            retry_delay = 5  # seconds
+            batch_size_minutes = 480  # Reduced batch size to 8 hours for better reliability
 
             while days_checked < HISTORY_DATA_PERIOD:
                 current_date -= timedelta(days=1)
-                if market_config and not self.is_trading_day(current_date, market_config):
+                if not self.is_trading_day(current_date, market_config):
                     continue
 
                 days_checked += 1
-                day_start, day_end = self.get_market_hours_utc(current_date, market_config)
-                if not day_start or not day_end:
-                    continue
+                self.logger.info(f"Processing historical data for {stock} on {current_date.date()}")
 
-                daily_data = pd.DataFrame()
-                current_batch_start = day_start
+                # Handle multiple sessions per day (e.g., J225)
+                sessions = []
+                if "session1_start" in market_config and "session1_end" in market_config:
+                    sessions.append((
+                        datetime.strptime(market_config["session1_start"], "%H:%M").time(),
+                        datetime.strptime(market_config["session1_end"], "%H:%M").time()
+                    ))
+                if "session2_start" in market_config and "session2_end" in market_config:
+                    sessions.append((
+                        datetime.strptime(market_config["session2_start"], "%H:%M").time(),
+                        datetime.strptime(market_config["session2_end"], "%H:%M").time()
+                    ))
+                
+                # If no specific sessions defined, use regular open/close
+                if not sessions:
+                    sessions = [(
+                        datetime.strptime(market_config["open"], "%H:%M").time(),
+                        datetime.strptime(market_config["close"], "%H:%M").time()
+                    )]
 
-                while current_batch_start < day_end:
-                    current_batch_end = min(
-                        current_batch_start + timedelta(minutes=999),
-                        day_end
-                    )
-
-                    # SKIP if already in DB
-                    if not await self.db_con.should_fetch_range(
-                        stock, 
-                        current_batch_start, 
-                        current_batch_end, 
-                        interval_minutes=1
-                    ):
-                        self.logger.info(
-                            f"Skipping {stock} data fetch from "
-                            f"{current_batch_start} to {current_batch_end} (already present)"
+                for session_start, session_end in sessions:
+                    # For overnight sessions, we need to handle the date transition
+                    is_overnight = session_end < session_start
+                    
+                    if is_overnight:
+                        # For overnight sessions, we need to fetch data from current day's start to next day's end
+                        day_start, day_end = self.get_market_hours_utc(
+                            current_date, 
+                            market_config, 
+                            session_start, 
+                            session_end
                         )
-                        # advance cursor and continue
-                        current_batch_start = current_batch_end + timedelta(minutes=1)
+                    else:
+                        # For regular sessions, use the same day
+                        day_start, day_end = self.get_market_hours_utc(
+                            current_date, 
+                            market_config, 
+                            session_start, 
+                            session_end
+                        )
+
+                    if not day_start or not day_end:
                         continue
 
-                    start_str = current_batch_start.strftime('%Y-%m-%dT%H:%M:%S')
-                    end_str   = current_batch_end.strftime('%Y-%m-%dT%H:%M:%S')
-                    self.logger.info(f"Fetching {stock} data from {start_str} to {end_str}")
+                    daily_data = pd.DataFrame()
+                    current_batch_start = day_start
+                    retry_count = 0
 
-                    batch_data = await self.capital_client.get_recent_data(
-                        epic=stock,
-                        start_dt_str=start_str,
-                        end_dt_str=end_str,
-                        interval='1minute'
-                    )
+                    while current_batch_start < day_end:
+                        current_batch_end = min(
+                            current_batch_start + timedelta(minutes=batch_size_minutes),
+                            day_end
+                        )
 
-                    if not batch_data.empty:
-                        daily_data = pd.concat([daily_data, batch_data])
+                        # Skip if data already exists
+                        if not await self.db_con.should_fetch_range(
+                            stock, 
+                            current_batch_start, 
+                            current_batch_end, 
+                            interval_minutes=1
+                        ):
+                            self.logger.info(
+                                f"Skipping {stock} data fetch from "
+                                f"{current_batch_start} to {current_batch_end} (already present)"
+                            )
+                            current_batch_start = current_batch_end + timedelta(minutes=1)
+                            continue
 
-                    # Move to next batch (add 1 minute to avoid overlap)
-                    current_batch_start = current_batch_end + timedelta(minutes=1)
+                        start_str = current_batch_start.strftime('%Y-%m-%dT%H:%M:%S')
+                        end_str = current_batch_end.strftime('%Y-%m-%dT%H:%M:%S')
+                        self.logger.info(f"Fetching {stock} data from {start_str} to {end_str}")
 
-                if not daily_data.empty:
-                    await self.calculate_pivot_data(daily_data)
-                    await self.db_con.save_data_to_db(daily_data)
+                        while retry_count < max_retries:
+                            try:
+                                batch_data = await self.capital_client.get_recent_data(
+                                    epic=stock,
+                                    start_dt_str=start_str,
+                                    end_dt_str=end_str,
+                                    interval='1minute'
+                                )
+                                
+                                if not batch_data.empty:
+                                    daily_data = pd.concat([daily_data, batch_data])
+                                break  # Success, exit retry loop
+                            except Exception as e:
+                                retry_count += 1
+                                if retry_count == max_retries:
+                                    self.logger.error(f"Failed to fetch data for {stock} after {max_retries} attempts: {str(e)}")
+                                    break
+                                self.logger.warning(f"Retry {retry_count}/{max_retries} for {stock} due to: {str(e)}")
+                                await asyncio.sleep(retry_delay)
 
+                        # Reset retry count for next batch
+                        retry_count = 0
+                        current_batch_start = current_batch_end + timedelta(minutes=1)
 
-    def get_market_hours_utc(self, date: datetime, market_config: dict):
-        """Get trading hours for a specific date"""
+                    if not daily_data.empty:
+                        try:
+                            await self.calculate_pivot_data(daily_data)
+                            await self.db_con.save_data_to_db(daily_data)
+                            self.logger.info(f"Successfully saved {len(daily_data)} records for {stock} on {current_date.date()}")
+                        except Exception as e:
+                            self.logger.error(f"Error processing data for {stock} on {current_date.date()}: {str(e)}")
+
+    def get_market_hours_utc(self, date: datetime, market_config: dict, session_start: time = None, session_end: time = None):
+        """Get trading hours for a specific date and session"""
         tz = pytz.timezone(market_config["timezone"])
-        open_time = datetime.strptime(market_config["open"], "%H:%M").time()
-        close_time = datetime.strptime(market_config["close"], "%H:%M").time()
+        
+        # Use provided session times or fall back to market open/close
+        open_time = session_start or datetime.strptime(market_config["open"], "%H:%M").time()
+        close_time = session_end or datetime.strptime(market_config["close"], "%H:%M").time()
         
         # Create market open/close datetime in local timezone
         market_open = tz.localize(datetime.combine(date.date(), open_time))
-        market_close = tz.localize(datetime.combine(date.date(), close_time))
         
-        # Handle overnight sessions
+        # For overnight sessions, close time is on the next day
         if close_time < open_time:
-            market_close += timedelta(days=1)
+            market_close = tz.localize(datetime.combine(date.date() + timedelta(days=1), close_time))
+        else:
+            market_close = tz.localize(datetime.combine(date.date(), close_time))
             
         # Convert to UTC
         market_open_utc = market_open.astimezone(pytz.UTC).replace(tzinfo=None)
@@ -769,6 +830,7 @@ class StockIndicatorCalculator:
     ) -> float:
         """Calculates Stop Loss price based on strategy and Capital.com API rules."""
         # 1. Determine rounding step
+        stock_symbol = details.epic
         if details.min_step_distance_unit == 'PERCENTAGE':
             step = max(entry_price * (details.min_step_distance / 100), details.min_step_distance)
         else:
@@ -798,7 +860,7 @@ class StockIndicatorCalculator:
 
         # 3. Base SL based on strategy percentage
         # sl_pct = self.TRADE_PERC
-        sl_pct = self.SL_PERC
+        sl_pct = self.market_details.get(stock_symbol, {}).get('sl_perc', self.SL_PERC) or self.SL_PERC
         if direction == CapitalTransactionType.BUY:
             desired_sl = entry_price * (1 - sl_pct)
         else:
@@ -1178,7 +1240,7 @@ class StockIndicatorCalculator:
         # Set TTL for the stock timestamp key (100 seconds)
         self.redis_cache.client.expire(stock_ts_key, 30)
 
-        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, base_payload.stop_loss, base_payload.profit_level, breakout_direction)
+        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, base_payload.stop_loss, base_payload.profit_level, breakout_direction, "REVERSAL_BREAKOUT")
         # Momentum check
         # if self.is_invalid_momentum_trade(indicator_values):
         #     self.logger.info("HN: Invalid momentum indicators. Skipping.")
@@ -1204,25 +1266,26 @@ class StockIndicatorCalculator:
         }
 
         deal_reference = await self.capital_client.place_order(base_payload)
-        await self.db_con.log_trade_to_db(
-            final_stock_data,
-            indicator_values,
-            broken_level,
-            base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance,
-            base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance,
-            breakout_direction,
-            stock,
-            metadata_json,
-            base_payload.quantity,
-            order_status=True,
-            order_ids=[deal_reference] if deal_reference else [],
-            stock_ltp=stock_ltp
-        )
+        if LOG_TRADE_TO_DB:
+            await self.db_con.log_trade_to_db(
+                final_stock_data,
+                indicator_values,
+                float(broken_level),
+                float(base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance),
+                float(base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance),
+                breakout_direction,
+                stock,
+                metadata_json,
+                qty=int(base_payload.quantity),
+                order_status=True if self.test_mode else False,
+                order_ids=[deal_reference] if deal_reference else [],
+                stock_ltp=str(stock_ltp)
+            )
 
         self.logger.info(f"HN : High-probability trade executed for {stock}: ")
 
 
-    async def analyze_sma_strategy(self, stock) -> None:
+    async def analyze_sma_strategy_type_1(self, stock) -> None:
         stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=HISTORY_DATA_PERIOD), self.end_date)
         if stock_data.empty:
             return
@@ -1335,10 +1398,11 @@ class StockIndicatorCalculator:
         await self.send_telegram_notification(
             final_stock_data,
             indicator_values,
-            broken_level,
-            base_payload.stop_loss,
-            base_payload.profit_level,
-            breakout_direction
+            float(broken_level),
+            float(base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance),
+            float(base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance),
+            breakout_direction,
+            "SMA_STRATEGY"
         )
 
         # Prepare metadata including ATR and SMAs
@@ -1349,20 +1413,21 @@ class StockIndicatorCalculator:
 
         # Place order and log trade
         deal_reference = await self.capital_client.place_order(base_payload)
-        await self.db_con.log_trade_to_db(
-            final_stock_data,
-            indicator_values,
-            broken_level,
-            base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance,
-            base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance,
-            breakout_direction,
-            stock,
-            metadata_json,
-            base_payload.quantity,
-            order_status=True if self.test_mode else False,
-            order_ids=[deal_reference] if deal_reference else [],
-            stock_ltp=stock_ltp
-        )
+        if LOG_TRADE_TO_DB:
+            await self.db_con.log_trade_to_db(
+                final_stock_data,
+                indicator_values,
+                float(broken_level),
+                float(base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance),
+                float(base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance),
+                breakout_direction,
+                stock,
+                metadata_json,
+                qty=int(base_payload.quantity),
+                order_status=True if self.test_mode else False,
+                order_ids=[deal_reference] if deal_reference else [],
+                stock_ltp=str(stock_ltp)
+            )
 
         self.logger.info(f"SMA: High-probability trade executed for {stock}: Direction {breakout_direction.value}")
 
@@ -1503,7 +1568,8 @@ class StockIndicatorCalculator:
             current_price,  # Using current price as broken level
             base_payload.stop_loss,
             base_payload.profit_level,
-            breakout_direction
+            breakout_direction,
+            "RSI_MACD_CROSS"
         )
 
         # Prepare metadata
@@ -1515,21 +1581,24 @@ class StockIndicatorCalculator:
         }
 
         # Place order and log trade
+        broken_level = 0
+
         deal_reference = await self.capital_client.place_order(base_payload)
-        await self.db_con.log_trade_to_db(
-            final_stock_data,
-            indicator_values,
-            current_price,  # Using current price as broken level
-            base_payload.stop_loss,
-            base_payload.profit_level,
-            breakout_direction,
-            stock,
-            metadata_json,
-            base_payload.quantity,
-            order_status=True if self.test_mode else False,
-            order_ids=[deal_reference] if deal_reference else [],
-            stock_ltp=stock_ltp
-        )
+        if LOG_TRADE_TO_DB:
+            await self.db_con.log_trade_to_db(
+                final_stock_data,
+                indicator_values,
+                float(broken_level),
+                float(base_payload.stop_distance),
+                float(base_payload.profit_distance),
+                breakout_direction,
+                stock,
+                metadata_json,
+                qty=int(base_payload.quantity),
+                order_status=True if self.test_mode else False,
+                order_ids=[deal_reference] if deal_reference else [],
+                stock_ltp=str(stock_ltp)
+            )
 
         self.logger.info(
             f"MACD: Trade executed for {stock}: Direction {breakout_direction.value}, "
@@ -1559,7 +1628,290 @@ class StockIndicatorCalculator:
         data['stock'] = stock
         return data
 
-    async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY'):
+
+    async def analyze_sma_strategy_type_2(self, stock) -> None:
+        """
+        Implements a dual-SMA crossover strategy (13-period and 200-period) with additional filter checks.
+        Entry conditions:
+          - BUY when close >= sma13 > sma200 and previously sma13 <= sma200
+          - SELL when close <= sma13 < sma200 and previously sma13 >= sma200
+        Exits and notifications are handled separately.
+        """
+        # 1. Load historical data
+        stock_data = await self.db_con.load_data_from_db(
+            stock,
+            self.end_date - timedelta(days=10),
+            self.end_date
+        )
+        # Require at least 200 bars for SMA200
+        if stock_data.empty or len(stock_data) < 200:
+            return
+
+        stock_data = stock_data.sort_values('timestamp').reset_index(drop=True)
+        final = stock_data.iloc[-1]
+
+        # 2. Handle exits and update open trades status
+        # await self.check_and_execute_exit_trade_type_2(final)
+        # await self.update_open_trades_status(stock_data)
+        await asyncio.gather(
+            self.check_and_execute_exit_trade_type_2(final),
+            self.update_open_trades_status(stock_data)
+        )
+
+        # 3. Enforce open/loss limits
+        # if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+        #     return
+        # if await self.db_con.check_loss_trades_count(self.TOTAL_TRADES_LIMIT):
+        #     return
+
+        # 4. Compute SMAs
+        stock_data['sma13'] = stock_data['close'].rolling(window=13).mean()
+        stock_data['sma200'] = stock_data['close'].rolling(window=200).mean()
+
+        # Latest values
+        sma13 = stock_data['sma13'].iloc[-1]
+        sma200 = stock_data['sma200'].iloc[-1]
+        close = final['close']
+
+        # Previous bar values
+        prev_sma13 = stock_data['sma13'].iloc[-2]
+        prev_sma200 = stock_data['sma200'].iloc[-2]
+
+        # 5. Determine entry signal
+        # BUY: sma13 has just crossed above sma200 and price is above sma13
+        buy_cond = (prev_sma13 <= prev_sma200) and (sma13 > sma200) and (close >= sma13)
+        # SELL: sma13 has just crossed below sma200 and price is below sma13
+        sell_cond = (prev_sma13 >= prev_sma200) and (sma13 < sma200) and (close <= sma13)
+
+        if not (buy_cond or sell_cond):
+            return
+
+        # direction = "BUY" if buy_cond else "SELL"
+        direction = CapitalTransactionType.BUY if buy_cond else CapitalTransactionType.SELL
+        level = sma13
+
+        # 6. Fetch current LTP and build order payload
+        stock_ltp = await self.get_stock_ltp(stock, final['ltp'])
+        payload = await self.get_base_payload_for_capital_order(
+            epic=stock,
+            stock_ltp=stock_ltp,
+            trans_type=direction,
+            order_type=CapitalOrderType.MARKET,
+            timestamp=final['timestamp'],
+            stock_data=stock_data
+        )
+        if not payload:
+            return
+
+        # 7. Deduplicate via Redis
+        await asyncio.sleep(random.random())
+        key = f"order:{stock}:{final['timestamp']}"
+        if not self.redis_cache.client.setnx(key, 1):
+            return
+        self.redis_cache.client.expire(key, 30)
+
+        # 8. Calculate additional indicators
+        rsi, adx, mfi = await asyncio.gather(
+            self.calculate_rsi_talib(stock_data),
+            self.calculate_adx_talib(stock_data),
+            self.calculate_mfi_talib(stock_data)
+        )
+
+        # 9. Notify and place order
+        await self.send_telegram_notification(
+            final,
+            IndicatorValues(rsi=rsi, adx=adx, mfi=mfi),
+            level,
+            payload.stop_loss,
+            payload.profit_level,
+            direction,
+            "SMA_STRATEGY_TYPE_2"
+        )
+
+        deal_ref = await self.capital_client.place_order(payload)
+
+        # 10. Log trade
+        if LOG_TRADE_TO_DB:
+            await self.db_con.log_trade_to_db(
+                final,
+                IndicatorValues(rsi=rsi, adx=adx, mfi=mfi),
+                level,
+                payload.stop_loss,
+                payload.profit_level,
+                direction,
+                stock,
+                {"sma13": sma13, "sma200": sma200},
+                qty=int(payload.quantity),
+                order_status=bool(deal_ref),
+                order_ids=[deal_ref] if deal_ref else [],
+                stock_ltp=stock_ltp
+            )
+
+        self.logger.info(f"{stock}: SMA strategy trade executed.")
+
+    # 2. MA Crossover Strategy (15-min bars)
+    async def analyze_ma_crossover_strategy_type_2(self, symbol) -> None:
+        """
+        40/100 MA crossover on 15-min timeframe.
+        Entry Long: 40MA crosses above 100MA, gap ≥5 pips & close > crossover bar
+        Entry Short: opposite
+        SL: 10 pips, TP: 20 pips, optional trailing SL
+        """
+        df = await self.db_con.load_data_from_db(
+            symbol,
+            self.end_date - timedelta(days=5),
+            self.end_date
+        )
+        if df.empty:
+            return
+        df = df.sort_values('timestamp')
+        # align to 15-min
+        df = await self.transform_data_to_15min(symbol, df)
+        if len(df) < 100:
+            return
+        now = df['timestamp'].iloc[-1]
+
+        df['ma_short'] = df['close'].rolling(40).mean()
+        df['ma_long'] = df['close'].rolling(100).mean()
+        prev_s, prev_l = df['ma_short'].iloc[-2], df['ma_long'].iloc[-2]
+        cur_s, cur_l = df['ma_short'].iloc[-1], df['ma_long'].iloc[-1]
+
+        # Check entry
+        direction = None
+        if prev_s <= prev_l and cur_s > cur_l and df['close'].iloc[-1] > df['close'].iloc[-2]:
+            direction = CapitalTransactionType.BUY
+        elif prev_s >= prev_l and cur_s < cur_l and df['close'].iloc[-1] < df['close'].iloc[-2]:
+            direction = CapitalTransactionType.SELL
+        else:
+            return
+
+        entry = df['ltp'].iloc[-1]
+
+        payload = await self.get_base_payload_for_capital_order(
+            epic=symbol,
+            stock_ltp=entry,
+            trans_type=direction,
+            order_type=CapitalOrderType.MARKET,
+            timestamp=now,
+            stock_data=df
+        )
+        if not payload:
+            return
+
+        await asyncio.sleep(random.uniform(0,1))
+        key = f"ma:{symbol}:{now}"
+        if not self.redis_cache.client.setnx(key,1):
+            return
+        self.redis_cache.client.expire(key,30)
+
+        indicator_values = IndicatorValues(rsi=0, adx=0, mfi=0)
+
+        await self.send_telegram_notification(df.iloc[-1], indicator_values, entry,
+                                             payload.stop_loss,
+                                             payload.profit_level,
+                                             payload.transaction_type,
+                                             "MA_CROSSOVER")
+        deal_ref = await self.capital_client.place_order(payload)
+        if LOG_TRADE_TO_DB:
+            await self.db_con.log_trade_to_db(
+                df.iloc[-1],
+                indicator_values,
+                entry,
+                payload.stop_loss,
+                payload.profit_level,
+                direction,
+                symbol,
+                metadata_json=None,
+                qty=payload.quantity,
+                order_status=not self.test_mode,
+                order_ids=[deal_ref] if deal_ref else [],
+                stock_ltp=str(entry)
+            )
+        self.logger.info(f"MA Cross: {symbol} {direction.value} @ {entry:.5f}")
+
+    # 3. Mean-Reversion Strategy (15-min bars)
+    async def analyze_mean_reversion_strategy(self, symbol) -> None:
+        """
+        Mean-reversion on 15-min bars using RSI, Bollinger Bands, Z-score.
+        Entry Long: RSI<30, price ≤ lower BB, z-score ≤ -1.5
+        Entry Short: RSI>70, price ≥ upper BB, z-score ≥ +1.5
+        SL: 15 pips or opposite BB touch, TP: revert to mean, Time-exit 30min
+        """
+        df = await self.db_con.load_data_from_db(
+            symbol,
+            self.end_date - timedelta(days=5),
+            self.end_date
+        )
+        if df.empty:
+            return
+        df = df.sort_values('timestamp')
+        df = await self.transform_data_to_15min(symbol, df)
+        if len(df) < 30:
+            return
+        now = df['timestamp'].iloc[-1]
+
+        closes = df['close'].values
+        rsi = talib.RSI(closes, timeperiod=14)
+        upper, middle, lower = talib.BBANDS(closes, timeperiod=20, nbdevup=2, nbdevdn=2)
+        mean = pd.Series(closes).rolling(20).mean().iloc[-1]
+        std = pd.Series(closes).rolling(20).std().iloc[-1]
+        z = (closes[-1] - mean) / std if std>0 else 0
+
+        cur_price = df['ltp'].iloc[-1]
+        # pip = symbol.pip_to_price(1)
+        direction = CapitalTransactionType.BUY
+        if rsi[-1] < 30 and cur_price <= lower[-1] and z <= -1.5:
+            direction = CapitalTransactionType.BUY
+        elif rsi[-1] > 70 and cur_price >= upper[-1] and z >= 1.5:
+            direction = CapitalTransactionType.SELL
+        # else:
+        #     return
+
+        entry = cur_price
+
+        payload = await self.get_base_payload_for_capital_order(
+            epic=symbol,
+            stock_ltp=entry,
+            trans_type=direction,
+            order_type=CapitalOrderType.MARKET,
+            timestamp=now,
+            stock_data=df
+        )
+        if not payload:
+            return
+
+        await asyncio.sleep(random.uniform(0,1))
+        key = f"mr:{symbol}:{now}"
+        if not self.redis_cache.client.setnx(key,1):
+            return
+        self.redis_cache.client.expire(key,30)
+
+        indicator_values = IndicatorValues(rsi=0, adx=0, mfi=0)
+
+        await self.send_telegram_notification(df.iloc[-1], indicator_values, entry,
+                                             payload.stop_loss,
+                                             payload.profit_level,
+                                             payload.transaction_type,
+                                             "MEAN_REVERSION")
+        deal_ref = await self.capital_client.place_order(payload)
+        if LOG_TRADE_TO_DB:
+            await self.db_con.log_trade_to_db(
+                df.iloc[-1],
+                indicator_values,
+                float(entry),
+                float(payload.stop_loss),
+                float(payload.profit_level),
+                direction,
+                symbol,
+                metadata_json=None,
+                qty=int(payload.quantity),
+                order_status=not self.test_mode,
+                order_ids=[deal_ref] if deal_ref else [],
+                stock_ltp=str(entry)
+            )
+        self.logger.info(f"MeanRev: {symbol} {direction.value} @ {entry:.5f}")
+
+    async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY', strategy_type: str = None):
         stock = stock_data['stock']
         redis_key = f"message:{stock}"
         stock_name = self.stock_name_map.get(stock, stock)
@@ -1572,6 +1924,7 @@ class StockIndicatorCalculator:
                 f"Stock: {stock_name}\n"
                 f"LTP: {stock_data['ltp']}\n"
                 f"Action: {trade_type.value}\n"
+                f"Strategy: {strategy_type}\n"
                 f"SL: {sl}\n"
                 f"PL: {pl}\n"
                 f"Broke Resistance: {broken_level}\n"
@@ -1580,7 +1933,6 @@ class StockIndicatorCalculator:
                 f"MFI: {round(indicator_values.mfi, 2)}\n"
                 f"Stock Date & Time: {formatted_date_time}\n"
                 f"MSG Date & Time: {current_time}"
-
             )
 
             if TELEGRAM_NOTIFICATION.lower() == "true":
@@ -1589,7 +1941,6 @@ class StockIndicatorCalculator:
                 self.redis_cache.set_key(redis_key, 1, ttl=1800)
                 self.logger.info("Telegram notification sent successfully.")
 
-        
             with open(self.filename, "a") as f:
                 f.write(f"{message}\n\n")
                 return
@@ -1598,6 +1949,7 @@ class StockIndicatorCalculator:
             f"Stock: {stock_name}\n"
             f"LTP: {stock_data['ltp']}\n"
             f"Action: {trade_type.value}\n"
+            f"Strategy: {strategy_type}\n"
             f"SL: {sl}\n"
             f"PL: {pl}\n"
             f"Broke Resistance: {broken_level}\n"
@@ -1620,3 +1972,97 @@ class StockIndicatorCalculator:
             telegram_api.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
             self.redis_cache.set_key(redis_key, 1, ttl=1800)
             self.logger.info("Telegram notification sent successfully.")
+
+
+    # 1. Scalping Strategy (1-minute bars)
+    # async def analyze_scalping_strategy(self, symbol) -> None:
+    #     """
+    #     Scalping on 1-minute timeframe.
+    #     Entry Conditions:
+    #     - Mid-price shift > 2 pips in 5 seconds
+    #     - Order-book imbalance: bidVol/askVol > 1.5 or vice versa
+    #     - Spread > 1 pip above 1-min rolling average
+    #     - Momentum burst: 10 consecutive upticks or downticks
+    #     SL: 1 pip, TP: 2 pips, Time-exit: 10s
+    #     """
+    #     # Load 1-min data for last 5 minutes + live ticks
+    #     df = await self.db_con.load_data_from_db(
+    #         symbol,
+    #         self.end_date - timedelta(minutes=10),
+    #         self.end_date
+    #     )
+    #     if df.empty:
+    #         return
+
+    #     df = df.sort_values('timestamp')
+    #     latest = df.iloc[-1]
+    #     # Tick-level checks (assuming 'tick_time' and 'tick_price' columns exist)
+    #     now = latest['timestamp']
+    #     window_start = now - timedelta(seconds=5)
+    #     ticks = df[df['timestamp'] >= window_start]
+    #     if len(ticks) < 2:
+    #         return
+
+    #     mid_prices = (ticks['bid'] + ticks['ask']) / 2
+    #     delta = mid_prices.iloc[-1] - mid_prices.iloc[0]
+    #     pips = abs(delta) / symbol.pip_value
+    #     direction = 'LONG' if delta > 0 else 'SHORT'
+    #     if pips < 2:
+    #         return
+
+    #     # Order-book imbalance & spread
+    #     bid_vol = latest['bid_volume']
+    #     ask_vol = latest['ask_volume']
+    #     if not (bid_vol/ask_vol > 1.5 or ask_vol/bid_vol > 1.5):
+    #         return
+    #     spread = latest['ask'] - latest['bid']
+    #     avg_spread = df['ask'].sub(df['bid']).rolling('1min').mean().iloc[-1]
+    #     if spread <= avg_spread + symbol.pip_to_price(1):
+    #         return
+
+    #     # Momentum burst
+    #     last_ticks = ticks['tick_price'].diff().dropna()
+    #     if not (all(last_ticks > 0) or all(last_ticks < 0)):
+    #         return
+
+    #     # Compute entry, SL, TP
+    #     entry_price = latest['ltp']
+    #     pip = symbol.pip_to_price(1)
+    #     sl = entry_price - pip if direction=='LONG' else entry_price + pip
+    #     tp = entry_price + 2*pip if direction=='LONG' else entry_price - 2*pip
+
+    #     # Place order payload
+    #     payload = await self.get_base_payload_for_capital_order(
+    #         epic=symbol,
+    #         stock_ltp=entry_price,
+    #         trans_type=CapitalTransactionType.BUY if direction=='LONG' else CapitalTransactionType.SELL,
+    #         order_type=CapitalOrderType.MARKET,
+    #         timestamp=now,
+    #         stock_data=df
+    #     )
+    #     if not payload:
+    #         return
+    #     payload.stop_loss = sl
+    #     payload.profit_level = tp
+    #     payload.stop_distance = abs(entry_price - sl)
+    #     payload.profit_distance = abs(tp - entry_price)
+
+    #     # Random delay
+    #     await asyncio.sleep(random.uniform(0,1))
+    #     # Redis lock
+    #     key = f"scalp:{symbol}:{now}"
+    #     if not self.redis_cache.client.setnx(key,1):
+    #         return
+    #     self.redis_cache.client.expire(key,30)
+
+    #     # Send notification & place
+    #     await self.send_telegram_notification(latest, None, entry_price, sl, tp,
+    #                                          payload.transaction_type)
+    #     deal_ref = await self.capital_client.place_order(payload)
+    #     await self.db_con.log_trade_to_db(latest, None, entry_price, sl, tp,
+    #                                       payload.transaction_type, symbol,
+    #                                       {"strategy":"SCALPING"},
+    #                                       payload.quantity,
+    #                                       order_status=not self.test_mode,
+    #                                       order_ids=[deal_ref] if deal_ref else [])
+    #     self.logger.info(f"Scalping: {symbol} {direction} @ {entry_price:.5f}")

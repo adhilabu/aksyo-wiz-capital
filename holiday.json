@@ -1,11 +1,14 @@
 {
     "OIL_CRUDE": {
-        "open": "23:00",
-        "close": "22:00",
+        "open": "22:00",
+        "close": "21:59",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
         "leverage": "200:1",
+        "sl": "0.5",
+        "pl": "1.0",
+        "qty": "1",
         "orb_enabled": false
     },
     "US100": {
@@ -32,8 +35,8 @@
         "orb_enabled": true
     },
     "GOLD": {
-        "open": "23:00",
-        "close": "22:00",
+        "open": "03:30",
+        "close": "02:29",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
@@ -46,10 +49,6 @@
     "J225": {
         "open": "00:00",
         "close": "23:59",
-        "session1_start": "00:00",
-        "session1_end": "02:30",
-        "session2_start": "03:30",
-        "session2_end": "06:25",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [
@@ -81,8 +80,8 @@
         "orb_enabled": false
     },
     "US30": {
-        "open": "13:30",
-        "close": "21:00",
+        "open": "00:00",
+        "close": "23:59",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [
@@ -110,6 +109,9 @@
         "weekend_trading": true,
         "holidays": [],
         "leverage": "20:1",
+        "sl_perc": 0.006,
+        "pl_perc": 0.012,
+        "qty": "0.01",
         "orb_enabled": false
     },
     "ETHUSD": {
@@ -119,11 +121,14 @@
         "weekend_trading": true,
         "holidays": [],
         "leverage": "20:1",
+        "sl_perc": 0.006,
+        "pl_perc": 0.012,
+        "qty": "0.1",
         "orb_enabled": false
     },
     "USCOCOA": {
-        "open": "08:45",
-        "close": "17:30",
+        "open": "00:00",
+        "close": "23:59",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
@@ -134,8 +139,8 @@
         "orb_enabled": true
     },
     "USDJPY": {
-        "open": "22:00",
-        "close": "21:59",
+        "open": "00:00",
+        "close": "23:59",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
@@ -146,12 +151,15 @@
         "orb_enabled": false
     },
     "EURJPY": {
-        "open": "22:00",
-        "close": "21:59",
+        "open": "00:00",
+        "close": "23:59",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
         "leverage": "200:1",
+        "sl": "0.150",
+        "pl": "0.300",
+        "qty": "2400",
         "orb_enabled": false
     }
 }

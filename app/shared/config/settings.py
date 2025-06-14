@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     TRADE_ANALYSIS_TYPE: TradeAnalysisType = TradeAnalysisType.NORMAL
     PULSAR_TOPIC: str = 'capital-topic'
     STOCK_PER_PRICE_LIMIT: int = 1000
+    MIGRATIONS_FILE: str = "D:/projects/aksyo-wiz/app/sql/migrations.sql"    
 
     class Config:
         env_file = ".env"
