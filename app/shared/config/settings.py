@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     PULSAR_TOPIC: str = 'capital-topic'
     STOCK_PER_PRICE_LIMIT: int = 1000
     MIGRATIONS_FILE: str = "D:/projects/aksyo-wiz/app/sql/migrations.sql"    
+    SL_PERC: float = 0.004  # 1% stop loss
 
     class Config:
         env_file = ".env"
