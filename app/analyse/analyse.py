@@ -133,7 +133,7 @@ class StockIndicatorCalculator:
             self.analyze_mean_reversion_strategy(stock),
             self.analyze_ma_crossover_strategy_type_2(stock),
             self.analyze_sma_strategy_type_2(stock),
-            self.analyze_sma_macd_crossover_strategy(stock, timestamp),
+            self.analyze_sma_macd_crossover_strategy(stock),
             self.analyze_reversal_breakout_strategy(stock, timestamp),
             self.analyze_sma_strategy_type_1(stock),
         )
@@ -1115,7 +1115,7 @@ class StockIndicatorCalculator:
         
         # Existing checks remain unchanged
         # await self.check_and_execute_exit_trade_type_2(final_stock_data)
-        await self.update_open_trades_status(stock_data)
+        # await self.update_open_trades_status(stock_data)
         if stock in self.executed_breakouts and self.executed_breakouts[stock]:
             self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
             return
@@ -1295,7 +1295,7 @@ class StockIndicatorCalculator:
         final_stock_data = stock_data.iloc[-1]
         current_timestamp = stock_data.iloc[-1]['timestamp']
         # Existing checks remain unchanged
-        await self.update_open_trades_status(stock_data)        
+        # await self.update_open_trades_status(stock_data)        
         # open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
         # if open_results:
         #     self.logger.info(f"SMA: {stock}: Condition met, skipping trade")
@@ -1459,7 +1459,7 @@ class StockIndicatorCalculator:
             return
 
         # Update existing trades and check limits
-        await self.update_open_trades_status(stock_data)
+        # await self.update_open_trades_status(stock_data)
         # open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
         # if open_results:
         #     self.logger.info(f"MACD: {stock}: Max open trades reached, skipping")
@@ -1653,10 +1653,10 @@ class StockIndicatorCalculator:
         # 2. Handle exits and update open trades status
         # await self.check_and_execute_exit_trade_type_2(final)
         # await self.update_open_trades_status(stock_data)
-        await asyncio.gather(
-            self.check_and_execute_exit_trade_type_2(final),
-            self.update_open_trades_status(stock_data)
-        )
+        # await asyncio.gather(
+        #     self.check_and_execute_exit_trade_type_2(final),
+        #     self.update_open_trades_status(stock_data)
+        # )
 
         # 3. Enforce open/loss limits
         # if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
