@@ -182,7 +182,15 @@ class DBConnection:
 
         stock = stock_data['stock']
         stock_name = stock_name or stock
-        ltp = stock_ltp or stock_data['ltp']
+        # Ensure all numeric fields are proper floats for asyncpg
+        ltp = float(stock_ltp) if stock_ltp is not None else float(stock_data['ltp'])
+        sl = float(sl)
+        pl = float(pl)
+        cp = float(ltp)
+        broke_level = float(broken_level)
+        rsi = float(indicator_values.rsi)
+        adx = float(indicator_values.adx)
+        mfi = float(indicator_values.mfi)
         timestamp = stock_data['timestamp']
         query = """
         INSERT INTO order_details (stock, ltp, sl, pl, cp, broke_resistance_level, rsi, adx, mfi, timestamp, entry_price, trade_type, stock_name, metadata_json, qty, order_status, order_ids)
@@ -190,7 +198,24 @@ class DBConnection:
         """
         # Ensure trade_type is the string value ('BUY' or 'SELL') for DB insertion
         trade_type_value = trade_type.value if isinstance(trade_type, Enum) else trade_type
-        values = (stock, ltp, sl, pl, ltp, broken_level, indicator_values.rsi, indicator_values.adx, indicator_values.mfi, timestamp, trade_type_value, stock_name, json.dumps(metadata_json), qty, order_status, json.dumps(order_ids))
+        values = (
+            stock,
+            ltp,
+            sl,
+            pl,
+            cp,
+            broke_level,
+            rsi,
+            adx,
+            mfi,
+            timestamp,
+            trade_type_value,
+            stock_name,
+            json.dumps(metadata_json),
+            qty,
+            order_status,
+            json.dumps(order_ids),
+        )
         await self.execute(query, *values)
 
     async def get_historical_data_for_stock(self, stock, timestamp, rows=3):
@@ -352,31 +377,43 @@ class DBConnection:
         return len(data) == 0
     
     async def check_open_trades_count(self, count=10):
+        current_date = datetime.now().date()
         query = """
-        SELECT * FROM order_details WHERE status = 'OPEN' AND DATE(timestamp) = $1
+        SELECT * FROM order_details WHERE status = 'OPEN' AND DATE(timestamp) = $1 AND order_ids != '[]'
         """
-        data = await self.fetch(query, self.end_date)
+        data = await self.fetch(query, current_date)
         return len(data) >= count
     
     async def check_loss_trades_count(self, count=5):
+        current_date = datetime.now().date()
         query = """
-        SELECT * FROM order_details WHERE status = 'LOSS' AND DATE(timestamp) = $1
+        SELECT * FROM order_details WHERE status = 'LOSS' AND DATE(timestamp) = $1 AND order_ids != '[]'
         """
-        data = await self.fetch(query, self.end_date)
+        data = await self.fetch(query, current_date)
         return len(data) >= count
     
     async def check_trades_count(self, count=10):
+        current_date = datetime.now().date()
         query = """
-        SELECT * FROM order_details WHERE DATE(timestamp) = $1
+        SELECT * FROM order_details WHERE DATE(timestamp) = $1 AND DATE(timestamp) = $1 AND order_ids != '[]'
         """
-        data = await self.fetch(query, self.end_date)
+        data = await self.fetch(query, current_date)
         return len(data) >= count
     
     async def open_trades_exist(self, count=1):
+        current_date = datetime.now().date()
         query = """
-        SELECT COUNT(*) FROM order_details WHERE status = 'OPEN'
+        SELECT COUNT(*) FROM order_details WHERE status = 'OPEN' AND DATE(timestamp) = $1 AND order_ids != '[]'
         """
-        data = await self.fetch(query)
+        data = await self.fetch(query, current_date )
+        return data[0]['count'] >= count
+    
+    async def check_stock_trades_count(self, stock, count=10):
+        current_date = datetime.now().date()
+        query = """
+        SELECT COUNT(*) FROM order_details WHERE stock = $1 AND DATE(timestamp) = $2 AND order_ids != '[]'
+        """
+        data = await self.fetch(query, stock, current_date)
         return data[0]['count'] >= count
 
     async def delete_data_from_db_for_date(self, date_str: Optional[date] = None):
@@ -564,10 +601,11 @@ class DBConnection:
         await self.execute(query, json.dumps(metadata_json), id)
 
     async def check_loss_trades_count(self, count=5):
+        current_date = datetime.now().date()
         query = """
         SELECT * FROM order_details WHERE status = 'LOSS' AND DATE(timestamp) = $1
         """
-        data = await self.fetch(query, self.end_date)
+        data = await self.fetch(query, current_date)
         return len(data) >= count
 
     async def get_capital_market_details(self, epic: str, timestamp) -> Optional[CapitalMarketDetails]:
@@ -579,7 +617,7 @@ class DBConnection:
                      min_stop_or_profit_distance, min_stop_or_profit_distance_unit, max_stop_or_profit_distance, max_stop_or_profit_distance_unit,
                      decimal_places, margin_factor
             FROM capital_market_details
-            WHERE epic = $1 and DATE(created_at) = $2
+            WHERE epic = $1 and DATE(updated_at) = $2
         """ 
 
         data = await self.fetch(query, epic, timestamp.date())

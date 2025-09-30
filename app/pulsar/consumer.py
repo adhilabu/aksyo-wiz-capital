@@ -93,20 +93,25 @@ class PulsarConsumer:
         self.consumer = None
 
     async def process_message(self, msg):
-        """Process a single message."""
-        try:  
-            data = [ json.loads(m.data().decode("utf-8")) for m in msg ]
-            for m in msg:
-                self.consumer.acknowledge(m)
+        """Process a batch of messages."""
+        try:
+            messages = list(msg)
+            data = [json.loads(m.data().decode("utf-8")) for m in messages]
 
             transformed_data = transform_capital_ohlc(data)
             if transformed_data.empty:
+                for m in messages:
+                    await asyncio.to_thread(self.consumer.acknowledge, m)
                 return
 
             await self.analyse.update_all_stocks_data(transformed_data)
-        except Exception as e:
+
+            for m in messages:
+                await asyncio.to_thread(self.consumer.acknowledge, m)
+        except Exception:
             print(f"Failed to process message: {traceback.format_exc()}")
-            await asyncio.to_thread(self.consumer.negative_acknowledge, msg)
+            for m in msg:
+                await asyncio.to_thread(self.consumer.negative_acknowledge, m)
 
     async def close(self):
         """Gracefully shutdown the consumer."""
