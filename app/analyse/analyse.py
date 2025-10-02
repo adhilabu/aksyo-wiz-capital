@@ -51,7 +51,7 @@ class StockIndicatorCalculator:
     TOTAL_TRADES_LIMIT = 30
     OPEN_TRADES_LIMIT = 15
     LOSS_TRADE_LIMIT = 5
-    STOCK_TRADE_LIMIT = 5
+    STOCK_TRADE_LIMIT = 3
 
     def __init__(self, db_connection: DBConnection, redis_cache: RedisCache, start_date=None, end_date=None, test_mode=False):
         self.db_con: DBConnection = db_connection
@@ -1044,6 +1044,7 @@ class StockIndicatorCalculator:
 
         # Calculate base SL
         sl_pct = self.market_details.get(stock_symbol, {}).get('sl_perc', self.SL_PERC) or self.SL_PERC
+        self.logger.info(f"SL percentage: {sl_pct} for stock: {stock_symbol}")
         if direction == CapitalTransactionType.BUY:
             desired_sl = entry_price * (1 - sl_pct)
         else:
@@ -2227,7 +2228,7 @@ class StockIndicatorCalculator:
         if TELEGRAM_NOTIFICATION.lower() == "true":
             telegram_api = TelegramAPI(TELEGRAM_TOKEN)
             telegram_api.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-            self.redis_cache.set_key(redis_key, 1, ttl=1800)
+            self.redis_cache.set_key(redis_key, 1, ttl=60)
             self.logger.info("Telegram notification sent successfully.")
 
 

@@ -141,7 +141,7 @@ class CapitalAPI:
             "epic": basic_order.epic,
             "direction": basic_order.transaction_type.value, # BUY/SELL
             "size": basic_order.quantity,
-            "guaranteedStop": True, # Set to True if guaranteed stop is needed
+            "guaranteedStop": False, # Set to True if guaranteed stop is needed
         }
         if basic_order.stop_distance:
             payload["stopDistance"] = basic_order.stop_distance
@@ -162,7 +162,7 @@ class CapitalAPI:
             "size": basic_order.quantity,
             "level": basic_order.price, # The price for LIMIT/STOP
             "type": basic_order.order_type.value,
-            "guaranteedStop": True,
+            "guaranteedStop": False,
         }
         if basic_order.stop_distance:
             payload["stopDistance"] = basic_order.stop_distance
