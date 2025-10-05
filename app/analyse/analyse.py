@@ -111,12 +111,12 @@ class StockIndicatorCalculator:
         async def update_with_semaphore(row):
             try:
                 async with semaphore:
-                    await self.update_stock_data(row)
+                    await self.update_stock_data_v2(row)
             except Exception as e:
                 self.logger.error(f"Error processing row: {e}")
         # for _, row in transformed_data.iterrows():
-        #     await self.update_stock_data(row)
-        tasks = [self.update_stock_data(row) for _, row in transformed_data.iterrows()]
+        #     await self.update_stock_data_v2(row)
+        tasks = [self.update_stock_data_v2(row) for _, row in transformed_data.iterrows()]
         await asyncio.gather(*tasks)
         timestamp = transformed_data.iloc[0]['timestamp'] if len(transformed_data) > 0 else 'Empty'
         self.logger.info(f"Inserted data for timestamp: {timestamp}.")
@@ -1224,7 +1224,8 @@ class StockIndicatorCalculator:
         stock_per_price = self.stock_per_price_limit
         if leverage_factor < 100:
             stock_per_price = stock_per_price / 2
-        initial_quantity = float(stock_per_price / stock_ltp)
+        # initial_quantity = float(stock_per_price / stock_ltp)
+        initial_quantity = float(self.market_details.get(epic, {}).get('qty', float(stock_per_price / stock_ltp)))
         if initial_quantity <= 0:
             self.logger.warning(f"Calculated quantity is zero or negative for {epic} at LTP {stock_ltp}. Skipping order.")
             return None
@@ -2324,3 +2325,1185 @@ class StockIndicatorCalculator:
     #                                       order_status=not self.test_mode,
     #                                       order_ids=[deal_ref] if deal_ref else [])
     #     self.logger.info(f"Scalping: {symbol} {direction} @ {entry_price:.5f}")
+
+    async def update_stock_data_v1(self, data: pd.Series):
+        stock = data['stock']
+        timestamp = pd.to_datetime(data['timestamp'])
+        existing_timestamps = await self.db_con.fetch_existing_timestamps(stock)
+        if timestamp in existing_timestamps:
+            await self.db_con.update_stock_data_for_historical_data_v2(data)
+            return
+
+        self.logger.info(f"Inserting data for stock: {stock} and timestamp: {timestamp}.")
+        await self.db_con.save_data_to_db(data.to_frame().T)
+
+        # Run high-probability strategies in parallel
+        await asyncio.gather(
+            self.analyze_multi_timeframe_breakout(stock, timestamp),
+            self.analyze_volume_price_confirmation(stock, timestamp),
+            self.analyze_smart_money_concepts(stock, timestamp),
+            self.analyze_institutional_levels(stock, timestamp),
+            self.analyze_momentum_breakout(stock, timestamp),
+            self.analyze_volatility_contraction(stock, timestamp),
+            # Keep some existing high-performing strategies
+            self.analyze_reversal_breakout_strategy(stock, timestamp),
+            self.analyze_sma_macd_crossover_strategy(stock),
+        )
+
+    async def analyze_multi_timeframe_breakout(self, stock: str, timestamp: datetime) -> None:
+        """
+        Multi-timeframe breakout strategy using 5min, 15min, and 1hr timeframes
+        Higher probability when breakouts align across multiple timeframes
+        """
+        # Load data for different timeframes
+        stock_data_1min = await self.db_con.load_data_from_db_with_timestamp(
+            stock, timestamp - timedelta(days=3), timestamp
+        )
+        
+        if stock_data_1min.empty:
+            return
+
+        # Transform to different timeframes
+        stock_data_5min = await self.transform_1_min_data_to_5_min_data(stock, stock_data_1min)
+        stock_data_15min = await self.transform_data_to_15min(stock, stock_data_1min)
+        stock_data_1hour = await self.transform_data_to_1hour(stock, stock_data_1min)
+
+        if len(stock_data_5min) < 50 or len(stock_data_15min) < 20 or len(stock_data_1hour) < 10:
+            return
+
+        # Calculate key levels for each timeframe
+        resistance_5min, support_5min = await self.calculate_dynamic_support_resistance(stock_data_5min)
+        resistance_15min, support_15min = await self.calculate_dynamic_support_resistance(stock_data_15min)
+        resistance_1hour, support_1hour = await self.calculate_dynamic_support_resistance(stock_data_1hour)
+
+        current_price = stock_data_1min['ltp'].iloc[-1]
+        current_close = stock_data_1min['close'].iloc[-1]
+
+        # Check for aligned breakouts
+        breakout_direction = None
+        breakout_strength = 0
+
+        # Bullish breakout alignment
+        if (current_close > resistance_5min and 
+            current_close > resistance_15min and 
+            current_close > resistance_1hour):
+            breakout_direction = CapitalTransactionType.BUY
+            breakout_strength = 3
+        # Bearish breakout alignment  
+        elif (current_close < support_5min and 
+            current_close < support_15min and 
+            current_close < support_1hour):
+            breakout_direction = CapitalTransactionType.SELL
+            breakout_strength = 3
+        # Partial alignment (still high probability)
+        elif current_close > resistance_5min and current_close > resistance_15min:
+            breakout_direction = CapitalTransactionType.BUY
+            breakout_strength = 2
+        elif current_close < support_5min and current_close < support_15min:
+            breakout_direction = CapitalTransactionType.SELL
+            breakout_strength = 2
+
+        if breakout_direction and breakout_strength >= 2:
+            await self.execute_high_probability_trade(
+                stock, stock_data_1min, breakout_direction, 
+                f"MULTI_TF_BREAKOUT_STR{breakout_strength}", timestamp
+            )
+
+    async def analyze_volume_price_confirmation(self, stock: str, timestamp: datetime) -> None:
+        """
+        Volume-Price confirmation strategy
+        Looks for high volume breakouts with price confirmation
+        """
+        stock_data = await self.db_con.load_data_from_db_with_timestamp(
+            stock, timestamp - timedelta(days=2), timestamp
+        )
+        
+        if stock_data.empty or len(stock_data) < 50:
+            return
+
+        # Calculate volume indicators
+        stock_data['volume_sma'] = stock_data['volume'].rolling(window=20).mean()
+        stock_data['volume_ratio'] = stock_data['volume'] / stock_data['volume_sma']
+        
+        # Price momentum
+        stock_data['price_change'] = stock_data['close'].pct_change()
+        stock_data['volatility'] = stock_data['high'] - stock_data['low']
+
+        current_data = stock_data.iloc[-1]
+        prev_data = stock_data.iloc[-2]
+
+        # High volume breakout conditions
+        high_volume = current_data['volume_ratio'] > 2.0  # 2x average volume
+        significant_move = abs(current_data['price_change']) > 0.002  # 0.2% move
+        increased_volatility = current_data['volatility'] > prev_data['volatility'] * 1.2
+
+        if high_volume and significant_move and increased_volatility:
+            direction = CapitalTransactionType.BUY if current_data['price_change'] > 0 else CapitalTransactionType.SELL
+            
+            # Additional confirmation: price closed near high/low of the period
+            if direction == CapitalTransactionType.BUY:
+                price_confirmation = (current_data['close'] - current_data['low']) / current_data['volatility'] > 0.6
+            else:
+                price_confirmation = (current_data['high'] - current_data['close']) / current_data['volatility'] > 0.6
+
+            if price_confirmation:
+                await self.execute_high_probability_trade(
+                    stock, stock_data, direction, "VOLUME_PRICE_CONFIRMATION", timestamp
+                )
+
+    async def analyze_smart_money_concepts(self, stock: str, timestamp: datetime) -> None:
+        """
+        Smart Money Concepts strategy focusing on institutional trading patterns
+        Includes Order Blocks, Liquidity Grabs, and Fair Value Gaps
+        """
+        stock_data_5min = await self.get_transformed_data(stock, timestamp, '5min', days=5)
+        
+        if stock_data_5min.empty or len(stock_data_5min) < 100:
+            return
+
+        # Identify Order Blocks (institutional entry zones)
+        order_blocks = await self.identify_order_blocks(stock_data_5min)
+        if not order_blocks:
+            return
+
+        current_price = stock_data_5min['close'].iloc[-1]
+        current_low = stock_data_5min['low'].iloc[-1]
+        current_high = stock_data_5min['high'].iloc[-1]
+
+        # Check if price is reacting to order blocks
+        for block in order_blocks[-3:]:  # Check recent 3 blocks
+            block_type = block['type']
+            block_high = block['high']
+            block_low = block['low']
+            
+            # Bullish order block reaction
+            if (block_type == 'bullish' and 
+                current_low <= block_high and current_low >= block_low and
+                stock_data_5min['close'].iloc[-1] > stock_data_5min['open'].iloc[-1]):  # Bullish candle
+                
+                await self.execute_high_probability_trade(
+                    stock, stock_data_5min, CapitalTransactionType.BUY, 
+                    "SMART_MONEY_BULLISH_OB", timestamp
+                )
+                break
+                
+            # Bearish order block reaction
+            elif (block_type == 'bearish' and 
+                current_high >= block_low and current_high <= block_high and
+                stock_data_5min['close'].iloc[-1] < stock_data_5min['open'].iloc[-1]):  # Bearish candle
+                
+                await self.execute_high_probability_trade(
+                    stock, stock_data_5min, CapitalTransactionType.SELL, 
+                    "SMART_MONEY_BEARISH_OB", timestamp
+                )
+                break
+
+    async def analyze_institutional_levels(self, stock: str, timestamp: datetime) -> None:
+        """
+        Trade based on key institutional levels: Previous Day High/Low, Weekly levels
+        """
+        stock_data_1min = await self.db_con.load_data_from_db_with_timestamp(
+            stock, timestamp - timedelta(days=7), timestamp
+        )
+        
+        if stock_data_1min.empty:
+            return
+
+        # Calculate key institutional levels
+        prev_day_data = stock_data_1min[stock_data_1min['timestamp'].dt.date == (timestamp.date() - timedelta(days=1))]
+        weekly_data = stock_data_1min[stock_data_1min['timestamp'].dt.isocalendar().week == timestamp.isocalendar().week]
+        
+        if prev_day_data.empty or weekly_data.empty:
+            return
+
+        # Key levels
+        prev_day_high = prev_day_data['high'].max()
+        prev_day_low = prev_day_data['low'].min()
+        prev_day_close = prev_day_data['close'].iloc[-1]
+        
+        weekly_high = weekly_data['high'].max()
+        weekly_low = weekly_data['low'].min()
+        
+        current_price = stock_data_1min['ltp'].iloc[-1]
+        current_high = stock_data_1min['high'].iloc[-1]
+        current_low = stock_data_1min['low'].iloc[-1]
+
+        # Institutional level breakouts with confirmation
+        direction = None
+        strategy_name = ""
+        
+        # Previous day high breakout
+        if (current_high > prev_day_high and 
+            current_price > prev_day_high and 
+            abs(current_price - prev_day_high) / prev_day_high < 0.005):  # Within 0.5% of breakout
+            
+            direction = CapitalTransactionType.BUY
+            strategy_name = "INST_PREV_DAY_HIGH_BREAK"
+            
+        # Previous day low breakdown
+        elif (current_low < prev_day_low and 
+            current_price < prev_day_low and 
+            abs(current_price - prev_day_low) / prev_day_low < 0.005):
+            
+            direction = CapitalTransactionType.SELL
+            strategy_name = "INST_PREV_DAY_LOW_BREAK"
+            
+        # Weekly level reactions
+        elif current_price >= weekly_high * 0.999 and current_price <= weekly_high * 1.001:
+            direction = CapitalTransactionType.SELL  # Expect rejection at weekly high
+            strategy_name = "INST_WEEKLY_HIGH_REJECTION"
+            
+        elif current_price >= weekly_low * 0.999 and current_price <= weekly_low * 1.001:
+            direction = CapitalTransactionType.BUY  # Expect bounce at weekly low
+            strategy_name = "INST_WEEKLY_LOW_BOUNCE"
+
+        if direction:
+            await self.execute_high_probability_trade(
+                stock, stock_data_1min, direction, strategy_name, timestamp
+            )
+
+    async def analyze_momentum_breakout(self, stock: str, timestamp: datetime) -> None:
+        """
+        Momentum-based breakout strategy using RSI, ADX, and Volume
+        """
+        stock_data_5min = await self.get_transformed_data(stock, timestamp, '5min', days=3)
+        
+        if stock_data_5min.empty or len(stock_data_5min) < 50:
+            return
+
+        # Calculate momentum indicators
+        rsi = await self.calculate_rsi_talib(stock_data_5min)
+        adx = await self.calculate_adx_talib(stock_data_5min)
+        stock_data_5min['volume_sma'] = stock_data_5min['volume'].rolling(20).mean()
+        current_volume_ratio = stock_data_5min['volume'].iloc[-1] / stock_data_5min['volume_sma'].iloc[-1]
+
+        # Price action
+        current_close = stock_data_5min['close'].iloc[-1]
+        prev_close = stock_data_5min['close'].iloc[-2]
+        price_change = (current_close - prev_close) / prev_close
+
+        # Momentum breakout conditions
+        strong_trend = adx > 25
+        momentum_aligned = (rsi > 60 and price_change > 0) or (rsi < 40 and price_change < 0)
+        volume_confirmation = current_volume_ratio > 1.5
+
+        if strong_trend and momentum_aligned and volume_confirmation:
+            direction = CapitalTransactionType.BUY if price_change > 0 else CapitalTransactionType.SELL
+            
+            await self.execute_high_probability_trade(
+                stock, stock_data_5min, direction, "MOMENTUM_BREAKOUT", timestamp
+            )
+
+    async def analyze_volatility_contraction(self, stock: str, timestamp: datetime) -> None:
+        """
+        Volatility contraction (squeeze) breakout strategy
+        Trades the expansion after periods of low volatility
+        """
+        stock_data_5min = await self.get_transformed_data(stock, timestamp, '5min', days=5)
+        
+        if stock_data_5min.empty or len(stock_data_5min) < 100:
+            return
+
+        # Calculate Bollinger Bands and ATR for volatility measurement
+        bb_upper, bb_middle, bb_lower = await self.calculate_bbands_talib(stock_data_5min)
+        atr = await self.calculate_atr(stock_data_5min)
+        
+        # Volatility ratio (bandwidth)
+        bb_bandwidth = (bb_upper - bb_lower) / bb_middle if bb_middle else 0
+        
+        # Historical volatility context
+        stock_data_5min['range'] = stock_data_5min['high'] - stock_data_5min['low']
+        avg_range_20 = stock_data_5min['range'].rolling(20).mean().iloc[-1]
+        current_range = stock_data_5min['range'].iloc[-1]
+        
+        # Volatility contraction conditions
+        volatility_contraction = bb_bandwidth < 0.02  # Very tight bands
+        low_historical_vol = current_range < avg_range_20 * 0.7
+        price_near_bands = (stock_data_5min['close'].iloc[-1] >= bb_upper or 
+                        stock_data_5min['close'].iloc[-1] <= bb_lower)
+
+        if volatility_contraction and low_historical_vol and price_near_bands:
+            direction = (CapitalTransactionType.BUY if stock_data_5min['close'].iloc[-1] >= bb_upper 
+                        else CapitalTransactionType.SELL)
+            
+            await self.execute_high_probability_trade(
+                stock, stock_data_5min, direction, "VOLATILITY_EXPANSION", timestamp
+            )
+
+    # Helper methods for the new strategies
+    async def get_transformed_data(self, stock: str, timestamp: datetime, timeframe: str, days: int = 3) -> pd.DataFrame:
+        """Helper to get transformed data for different timeframes"""
+        stock_data = await self.db_con.load_data_from_db_with_timestamp(
+            stock, timestamp - timedelta(days=days), timestamp
+        )
+        
+        if stock_data.empty:
+            return pd.DataFrame()
+        
+        if timeframe == '5min':
+            return await self.transform_1_min_data_to_5_min_data(stock, stock_data)
+        elif timeframe == '15min':
+            return await self.transform_data_to_15min(stock, stock_data)
+        elif timeframe == '1hour':
+            return await self.transform_data_to_1hour(stock, stock_data)
+        else:
+            return stock_data
+
+    async def transform_data_to_1hour(self, stock: str, in_data: pd.DataFrame) -> pd.DataFrame:
+        """Transform 1-minute data to 1-hour timeframe"""
+        data = in_data.copy()
+        if data.empty:
+            return data
+        
+        data['timestamp'] = pd.to_datetime(data['timestamp'])
+        data['timestamp'] = data['timestamp'].dt.tz_localize(None)
+        data['timestamp'] = data['timestamp'].dt.floor('1h')
+        
+        data = data.groupby(['stock', pd.Grouper(key='timestamp', freq='1h')]).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+            'open_interest': 'last',
+            'ltp': 'last'
+        }).reset_index()
+        
+        data['stock'] = stock
+        return data
+
+    async def calculate_dynamic_support_resistance(self, stock_data: pd.DataFrame, lookback: int = 20) -> tuple:
+        """Calculate dynamic support and resistance levels"""
+        if len(stock_data) < lookback:
+            return 0, 0
+        
+        recent_high = stock_data['high'].tail(lookback).max()
+        recent_low = stock_data['low'].tail(lookback).min()
+        
+        return recent_high, recent_low
+
+    async def identify_order_blocks(self, stock_data: pd.DataFrame) -> list:
+        """Identify Smart Money Order Blocks"""
+        blocks = []
+        
+        for i in range(2, len(stock_data)-1):
+            prev_candle = stock_data.iloc[i-1]
+            current_candle = stock_data.iloc[i]
+            next_candle = stock_data.iloc[i+1]
+            
+            # Bullish Order Block: Bear candle followed by bull candle
+            if (prev_candle['close'] < prev_candle['open'] and  # Bear candle
+                current_candle['close'] > current_candle['open'] and  # Bull candle
+                next_candle['close'] > next_candle['open']):  # Confirmation
+                
+                blocks.append({
+                    'type': 'bullish',
+                    'high': max(prev_candle['high'], current_candle['high']),
+                    'low': min(prev_candle['low'], current_candle['low']),
+                    'timestamp': current_candle['timestamp']
+                })
+                
+            # Bearish Order Block: Bull candle followed by bear candle
+            elif (prev_candle['close'] > prev_candle['open'] and  # Bull candle
+                current_candle['close'] < current_candle['open'] and  # Bear candle
+                next_candle['close'] < next_candle['open']):  # Confirmation
+                
+                blocks.append({
+                    'type': 'bearish',
+                    'high': max(prev_candle['high'], current_candle['high']),
+                    'low': min(prev_candle['low'], current_candle['low']),
+                    'timestamp': current_candle['timestamp']
+                })
+        
+        return blocks
+
+    async def execute_high_probability_trade(self, stock: str, stock_data: pd.DataFrame, 
+                                        direction: CapitalTransactionType, 
+                                        strategy_name: str, timestamp: datetime) -> None:
+        """
+        Unified method to execute high probability trades with proper risk management
+        """
+        # Check trade limits first
+        if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
+            self.logger.info(f"{strategy_name}: Max trades reached for {stock}. Skipping.")
+            return
+
+        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+            self.logger.info(f"{strategy_name}: Max open trades reached. Skipping.")
+            return
+
+        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+            self.logger.info(f"{strategy_name}: Max loss trades reached. Skipping.")
+            return
+
+        current_data = stock_data.iloc[-1]
+        stock_ltp = await self.get_stock_ltp(stock, current_data['ltp'])
+        
+        # Redis deduplication
+        stock_ts_key = f"order:{stock}:{timestamp}"
+        if not self.redis_cache.client.setnx(stock_ts_key, 1):
+            return
+        self.redis_cache.client.expire(stock_ts_key, 30)
+
+        # Prepare and execute order
+        base_payload = await self.get_base_payload_for_capital_order(
+            epic=stock,
+            stock_ltp=stock_ltp,
+            trans_type=direction,
+            order_type=CapitalOrderType.MARKET,
+            timestamp=timestamp,
+            stock_data=stock_data
+        )
+        
+        if not base_payload:
+            return
+
+        # Calculate indicators for logging
+        rsi, adx, mfi = await asyncio.gather(
+            self.calculate_rsi_talib(stock_data),
+            self.calculate_adx_talib(stock_data),
+            self.calculate_mfi_talib(stock_data)
+        )
+        
+        indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
+
+        # Send notification
+        await self.send_telegram_notification(
+            current_data,
+            indicator_values,
+            stock_ltp,  # Using current price as broken level
+            base_payload.stop_loss,
+            base_payload.profit_level,
+            direction,
+            strategy_name
+        )
+
+        # Prepare metadata
+        metadata_json = {
+            "strategy": strategy_name,
+            "rsi": rsi,
+            "adx": adx,
+            "timestamp": timestamp.isoformat()
+        }
+
+        # Execute trade
+        deal_reference = await self.capital_client.place_order(base_payload)
+        
+        if LOG_TRADE_TO_DB:
+            await self.db_con.log_trade_to_db(
+                current_data,
+                indicator_values,
+                float(stock_ltp),
+                float(base_payload.stop_loss),
+                float(base_payload.profit_level),
+                direction,
+                stock,
+                metadata_json,
+                qty=int(base_payload.quantity),
+                order_status=True if self.test_mode else False,
+                order_ids=[deal_reference] if deal_reference else [],
+                stock_ltp=str(stock_ltp)
+            )
+
+        self.logger.info(f"{strategy_name}: High-probability trade executed for {stock}: {direction.value}")
+
+
+# ############## update_stock_data_v2 implementation
+
+
+    async def update_stock_data_v2(self, data: pd.Series):
+        stock = data['stock']
+        timestamp = pd.to_datetime(data['timestamp'])
+        existing_timestamps = await self.db_con.fetch_existing_timestamps(stock)
+        if timestamp in existing_timestamps:
+            await self.db_con.update_stock_data_for_historical_data_v2(data)
+            return
+
+        self.logger.info(f"Inserting data for stock: {stock} and timestamp: {timestamp}.")
+        await self.db_con.save_data_to_db(data.to_frame().T)
+
+        # Run only high-accuracy strategies with proper filtering
+        await asyncio.gather(
+            self.analyze_smart_money_institutional_v2(stock, timestamp),
+            self.analyze_multi_timeframe_alignment_v2(stock, timestamp),
+            self.analyze_supply_demand_zones_enhanced_v2(stock, timestamp),
+            # Keep only the most reliable existing strategy
+            self.analyze_reversal_breakout_strategy(stock, timestamp),
+        )
+
+    async def analyze_smart_money_institutional_v2(self, stock: str, timestamp: datetime) -> None:
+        """
+        Advanced Smart Money Concepts with institutional confirmation
+        Combines Order Blocks, Liquidity, and Market Structure
+        """
+        # Get multiple timeframe data
+        stock_data_5min = await self.get_transformed_data(stock, timestamp, '5min', days=7)
+        stock_data_15min = await self.get_transformed_data(stock, timestamp, '15min', days=14)
+        stock_data_1hour = await self.get_transformed_data(stock, timestamp, '1hour', days=30)
+        
+        if any(df.empty for df in [stock_data_5min, stock_data_15min, stock_data_1hour]):
+            return
+
+        # Market Structure Analysis
+        market_structure = await self.analyze_market_structure(stock_data_1hour, stock_data_15min)
+        if not market_structure['valid_structure']:
+            return
+
+        # Find high-quality order blocks
+        quality_blocks = await self.find_quality_order_blocks(stock_data_15min, stock_data_1hour)
+        if not quality_blocks:
+            return
+
+        current_price = stock_data_5min['close'].iloc[-1]
+        current_candle = stock_data_5min.iloc[-1]
+
+        # Check for reactions at quality order blocks
+        for block in quality_blocks[-2:]:  # Only recent 2 blocks
+            if await self.is_quality_reaction(block, current_price, current_candle, stock_data_5min):
+                direction = CapitalTransactionType.BUY if block['type'] == 'bullish' else CapitalTransactionType.SELL
+                
+                # Additional confirmation: volume and momentum
+                if await self.confirm_with_volume_momentum(stock_data_5min, direction):
+                    await self.execute_high_accuracy_trade(
+                        stock, stock_data_5min, direction, "SMART_MONEY_INSTITUTIONAL", timestamp,
+                        confidence_level=block['confidence']
+                    )
+                    return  # Only take one trade per update
+
+    async def analyze_multi_timeframe_alignment_v2(self, stock: str, timestamp: datetime) -> None:
+        """
+        Multi-timeframe alignment strategy with strict confirmation
+        Requires alignment across 3 timeframes with volume confirmation
+        """
+        # Get data for multiple timeframes
+        timeframes = [
+            await self.get_transformed_data(stock, timestamp, '5min', days=3),
+            await self.get_transformed_data(stock, timestamp, '15min', days=7),
+            await self.get_transformed_data(stock, timestamp, '1hour', days=21)
+        ]
+        
+        # Check if we have sufficient data
+        if any(len(tf) < 50 for tf in timeframes if not tf.empty):
+            return
+
+        tf5, tf15, tf1h = timeframes
+
+        # Calculate trends for each timeframe
+        trend_5min = await self.calculate_trend_strength(tf5, period=20)
+        trend_15min = await self.calculate_trend_strength(tf15, period=20)
+        trend_1hour = await self.calculate_trend_strength(tf1h, period=20)
+
+        # Strict alignment conditions
+        aligned_bullish = (
+            trend_5min['direction'] == 'bullish' and trend_5min['strength'] > 0.6 and
+            trend_15min['direction'] == 'bullish' and trend_15min['strength'] > 0.5 and
+            trend_1hour['direction'] == 'bullish' and trend_1hour['strength'] > 0.4 and
+            trend_5min['rsi'] < 70 and trend_5min['rsi'] > 40  # RSI not overbought
+        )
+
+        aligned_bearish = (
+            trend_5min['direction'] == 'bearish' and trend_5min['strength'] > 0.6 and
+            trend_15min['direction'] == 'bearish' and trend_15min['strength'] > 0.5 and
+            trend_1hour['direction'] == 'bearish' and trend_1hour['strength'] > 0.4 and
+            trend_5min['rsi'] > 30 and trend_5min['rsi'] < 60  # RSI not oversold
+        )
+
+        if aligned_bullish or aligned_bearish:
+            direction = CapitalTransactionType.BUY if aligned_bullish else CapitalTransactionType.SELL
+            
+            # Volume confirmation
+            volume_confirm = await self.confirm_volume_pattern(tf5, direction)
+            if volume_confirm:
+                await self.execute_high_accuracy_trade(
+                    stock, tf5, direction, "MULTI_TF_ALIGNMENT", timestamp,
+                    confidence_level=0.8
+                )
+
+    async def analyze_supply_demand_zones_v2(self, stock: str, timestamp: datetime) -> None:
+        """
+        Supply and Demand zone strategy with institutional confirmation
+        Focuses on high-quality supply/demand zones with multiple confirmations
+        """
+        stock_data_15min = await self.get_transformed_data(stock, timestamp, '15min', days=30)
+        stock_data_1hour = await self.get_transformed_data(stock, timestamp, '1hour', days=60)
+        
+        if stock_data_15min.empty or stock_data_1hour.empty:
+            return
+
+        # Identify quality supply/demand zones
+        zones = await self.identify_quality_zones(stock_data_1hour, stock_data_15min)
+        if not zones:
+            return
+
+        current_price = stock_data_15min['close'].iloc[-1]
+        current_data = stock_data_15min.iloc[-1]
+
+        # Check for reactions at high-quality zones
+        for zone in zones:
+            if await self.is_zone_reaction(zone, current_price, current_data, stock_data_15min):
+                direction = CapitalTransactionType.BUY if zone['type'] == 'demand' else CapitalTransactionType.SELL
+                
+                # Multiple confirmations required
+                confirmations = await self.get_zone_confirmations(zone, stock_data_15min, direction)
+                if confirmations >= 2:  # Require at least 2 confirmations
+                    await self.execute_high_accuracy_trade(
+                        stock, stock_data_15min, direction, "SUPPLY_DEMAND_ZONES", timestamp,
+                        confidence_level=zone['quality']
+                    )
+                    return  # Only one zone trade per update
+
+    async def analyze_market_structure(self, hourly_data: pd.DataFrame, daily_data: pd.DataFrame) -> dict:
+        """
+        Analyze market structure for higher timeframe context
+        """
+        if len(hourly_data) < 50 or len(daily_data) < 20:
+            return {'valid_structure': False}
+
+        # Identify higher highs/lows for bullish structure
+        hh_h1 = hourly_data['high'].rolling(5).max().iloc[-1] > hourly_data['high'].rolling(5).max().iloc[-10]
+        hl_h1 = hourly_data['low'].rolling(5).min().iloc[-1] > hourly_data['low'].rolling(5).min().iloc[-10]
+        
+        # Identify lower highs/lows for bearish structure
+        lh_h1 = hourly_data['high'].rolling(5).max().iloc[-1] < hourly_data['high'].rolling(5).max().iloc[-10]
+        ll_h1 = hourly_data['low'].rolling(5).min().iloc[-1] < hourly_data['low'].rolling(5).min().iloc[-10]
+
+        bullish_structure = hh_h1 and hl_h1
+        bearish_structure = lh_h1 and ll_h1
+        
+        return {
+            'valid_structure': bullish_structure or bearish_structure,
+            'direction': 'bullish' if bullish_structure else 'bearish' if bearish_structure else 'neutral',
+            'strength': max(hourly_data['high'].tail(10).std(), 0.001)  # Avoid division by zero
+        }
+
+    async def find_quality_order_blocks(self, tf15_data: pd.DataFrame, tf1h_data: pd.DataFrame) -> list:
+        """
+        Find high-quality order blocks with institutional characteristics
+        """
+        blocks = []
+        
+        # Analyze 1-hour data for significant moves
+        for i in range(10, len(tf1h_data)-2):
+            if len(blocks) >= 5:  # Limit to 5 best blocks
+                break
+                
+            # Look for significant candles (3x average range)
+            avg_range = tf1h_data['high'].subtract(tf1h_data['low']).rolling(20).mean().iloc[i]
+            current_range = tf1h_data['high'].iloc[i] - tf1h_data['low'].iloc[i]
+            
+            if current_range < avg_range * 2:
+                continue  # Skip insignificant candles
+
+            # Bullish order block pattern
+            if (tf1h_data['close'].iloc[i] > tf1h_data['open'].iloc[i] and  # Bull candle
+                tf1h_data['close'].iloc[i+1] < tf1h_data['open'].iloc[i+1] and  # Bear candle
+                tf1h_data['low'].iloc[i] < tf1h_data['low'].iloc[i+1]):  # Protected low
+                
+                quality_score = await self.calculate_block_quality(tf1h_data, i, 'bullish')
+                if quality_score > 0.6:
+                    blocks.append({
+                        'type': 'bullish',
+                        'high': tf1h_data['high'].iloc[i],
+                        'low': tf1h_data['low'].iloc[i],
+                        'quality': quality_score,
+                        'confidence': quality_score,
+                        'timestamp': tf1h_data['timestamp'].iloc[i]
+                    })
+
+            # Bearish order block pattern
+            elif (tf1h_data['close'].iloc[i] < tf1h_data['open'].iloc[i] and  # Bear candle
+                tf1h_data['close'].iloc[i+1] > tf1h_data['open'].iloc[i+1] and  # Bull candle
+                tf1h_data['high'].iloc[i] > tf1h_data['high'].iloc[i+1]):  # Protected high
+                
+                quality_score = await self.calculate_block_quality(tf1h_data, i, 'bearish')
+                if quality_score > 0.6:
+                    blocks.append({
+                        'type': 'bearish',
+                        'high': tf1h_data['high'].iloc[i],
+                        'low': tf1h_data['low'].iloc[i],
+                        'quality': quality_score,
+                        'confidence': quality_score,
+                        'timestamp': tf1h_data['timestamp'].iloc[i]
+                    })
+
+        return sorted(blocks, key=lambda x: x['quality'], reverse=True)[:3]  # Return top 3
+
+    async def calculate_trend_strength(self, data: pd.DataFrame, period: int = 20) -> dict:
+        """
+        Calculate trend strength with multiple confirmations
+        """
+        if len(data) < period:
+            return {'direction': 'neutral', 'strength': 0, 'rsi': 50}
+
+        # SMA trend
+        sma_fast = data['close'].rolling(period//2).mean()
+        sma_slow = data['close'].rolling(period).mean()
+        
+        # Price position
+        current_close = data['close'].iloc[-1]
+        price_vs_fast = (current_close - sma_fast.iloc[-1]) / sma_fast.iloc[-1]
+        price_vs_slow = (current_close - sma_slow.iloc[-1]) / sma_slow.iloc[-1]
+        
+        # RSI
+        rsi = await self.calculate_rsi_talib(data.tail(period))
+        
+        # Trend determination
+        if price_vs_fast > 0.005 and price_vs_slow > 0.005:
+            direction = 'bullish'
+            strength = min(abs(price_vs_fast) * 100, 1.0)
+        elif price_vs_fast < -0.005 and price_vs_slow < -0.005:
+            direction = 'bearish'
+            strength = min(abs(price_vs_fast) * 100, 1.0)
+        else:
+            direction = 'neutral'
+            strength = 0
+
+        return {
+            'direction': direction,
+            'strength': strength,
+            'rsi': rsi,
+            'sma_alignment': sma_fast.iloc[-1] > sma_slow.iloc[-1] if direction == 'bullish' else sma_fast.iloc[-1] < sma_slow.iloc[-1]
+        }
+
+    async def identify_quality_zones(self, tf1h_data: pd.DataFrame, tf15_data: pd.DataFrame) -> list:
+        """
+        Identify high-quality supply and demand zones
+        """
+        zones = []
+        
+        # Look for significant rejection candles
+        for i in range(20, len(tf1h_data)-5):
+            current_candle = tf1h_data.iloc[i]
+            candle_range = current_candle['high'] - current_candle['low']
+            avg_range = tf1h_data['high'].subtract(tf1h_data['low']).rolling(20).mean().iloc[i]
+            
+            # Significant candle with long wick
+            if candle_range > avg_range * 1.5:
+                upper_wick = current_candle['high'] - max(current_candle['open'], current_candle['close'])
+                lower_wick = min(current_candle['open'], current_candle['close']) - current_candle['low']
+                
+                # Demand zone (long lower wick)
+                if lower_wick > upper_wick * 2 and lower_wick > candle_range * 0.3:
+                    quality = await self.calculate_zone_quality(tf1h_data, i, 'demand')
+                    if quality > 0.6:
+                        zones.append({
+                            'type': 'demand',
+                            'price_level': current_candle['low'],
+                            'quality': quality,
+                            'timestamp': current_candle['timestamp']
+                        })
+                
+                # Supply zone (long upper wick)
+                elif upper_wick > lower_wick * 2 and upper_wick > candle_range * 0.3:
+                    quality = await self.calculate_zone_quality(tf1h_data, i, 'supply')
+                    if quality > 0.6:
+                        zones.append({
+                            'type': 'supply',
+                            'price_level': current_candle['high'],
+                            'quality': quality,
+                            'timestamp': current_candle['timestamp']
+                        })
+
+        return sorted(zones, key=lambda x: x['quality'], reverse=True)[:5]  # Return top 5 zones
+
+    async def is_quality_reaction(self, block: dict, current_price: float, 
+                                current_candle: pd.Series, data: pd.DataFrame) -> bool:
+        """
+        Check if current price action shows quality reaction to order block
+        """
+        block_high = block['high']
+        block_low = block['low']
+        
+        # Check if price is in reaction zone (within 0.5% of block)
+        in_reaction_zone = (
+            (block['type'] == 'bullish' and current_price >= block_low and current_price <= block_low * 1.005) or
+            (block['type'] == 'bearish' and current_price <= block_high and current_price >= block_high * 0.995)
+        )
+        
+        if not in_reaction_zone:
+            return False
+
+        # Check for rejection candle
+        if block['type'] == 'bullish':
+            rejection = (current_candle['close'] > current_candle['open'] and 
+                        (current_candle['close'] - current_candle['low']) / (current_candle['high'] - current_candle['low']) > 0.6)
+        else:
+            rejection = (current_candle['close'] < current_candle['open'] and 
+                        (current_candle['high'] - current_candle['close']) / (current_candle['high'] - current_candle['low']) > 0.6)
+
+        # Volume confirmation
+        volume_avg = data['volume'].rolling(20).mean().iloc[-1]
+        volume_confirm = current_candle['volume'] > volume_avg * 1.2
+
+        return rejection and volume_confirm
+
+    async def confirm_with_volume_momentum(self, data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """
+        Confirm trade with volume and momentum indicators
+        """
+        if len(data) < 20:
+            return False
+
+        # Volume confirmation
+        current_volume = data['volume'].iloc[-1]
+        volume_avg = data['volume'].rolling(20).mean().iloc[-1]
+        volume_ok = current_volume > volume_avg * 1.2
+
+        # Momentum confirmation
+        rsi = await self.calculate_rsi_talib(data)
+        if direction == CapitalTransactionType.BUY:
+            momentum_ok = rsi > 45 and rsi < 75  # Not oversold, not extremely overbought
+        else:
+            momentum_ok = rsi < 55 and rsi > 25  # Not overbought, not extremely oversold
+
+        return volume_ok and momentum_ok
+
+    async def execute_high_accuracy_trade(self, stock: str, stock_data: pd.DataFrame, 
+                                        direction: CapitalTransactionType, 
+                                        strategy_name: str, timestamp: datetime,
+                                        confidence_level: float = 0.7) -> None:
+        """
+        Execute only high-confidence trades with enhanced risk management
+        """
+        # Skip if confidence is too low
+        if confidence_level < 0.65:
+            return
+
+        # Enhanced trade limit checks
+        if await self.db_con.check_stock_trades_count(stock, max(1, self.STOCK_TRADE_LIMIT // 2)):
+            self.logger.info(f"{strategy_name}: Max trades reached for {stock}. Skipping.")
+            return
+
+        if await self.db_con.check_open_trades_count(max(5, self.OPEN_TRADES_LIMIT // 2)):
+            self.logger.info(f"{strategy_name}: Max open trades reached. Skipping.")
+            return
+
+        # if await self.db_con.check_loss_trades_count(max(2, self.LOSS_TRADE_LIMIT // 2)):
+        #     self.logger.info(f"{strategy_name}: Max loss trades reached. Skipping.")
+        #     return
+
+        current_data = stock_data.iloc[-1]
+        stock_ltp = await self.get_stock_ltp(stock, current_data['ltp'])
+        
+        # Enhanced Redis deduplication with strategy-specific keys
+        # random sleep
+        await asyncio.sleep(random.uniform(0, 1))
+        strategy_key = f"order:{stock}"
+        if not self.redis_cache.client.setnx(strategy_key, 1):
+            self.logger.info(f"{strategy_name}: Already traded {stock}. Skipping.")
+            return
+        self.redis_cache.client.expire(strategy_key, 360)  # 1 hour expiry
+
+        # Adjust position size based on confidence
+        original_limit = self.stock_per_price_limit
+        self.stock_per_price_limit = original_limit * min(1.0, confidence_level + 0.2)
+
+        try:
+            base_payload = await self.get_base_payload_for_capital_order(
+                epic=stock,
+                stock_ltp=stock_ltp,
+                trans_type=direction,
+                order_type=CapitalOrderType.MARKET,
+                timestamp=timestamp,
+                stock_data=stock_data
+            )
+            
+            if not base_payload:
+                return
+
+            # Calculate indicators for logging
+            rsi, adx, mfi = await asyncio.gather(
+                self.calculate_rsi_talib(stock_data),
+                self.calculate_adx_talib(stock_data),
+                self.calculate_mfi_talib(stock_data)
+            )
+            
+            indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
+
+            # Send notification with confidence level
+            await self.send_telegram_notification(
+                current_data,
+                indicator_values,
+                stock_ltp,
+                base_payload.stop_loss,
+                base_payload.profit_level,
+                direction,
+                f"{strategy_name}_CONF:{confidence_level:.2f}"
+            )
+
+            # Enhanced metadata
+            metadata_json = {
+                "strategy": strategy_name,
+                "confidence": confidence_level,
+                "rsi": rsi,
+                "adx": adx,
+                "timestamp": timestamp.isoformat(),
+                "risk_adjusted": True
+            }
+
+            # Execute trade
+            deal_reference = await self.capital_client.place_order(base_payload)
+            
+            if LOG_TRADE_TO_DB:
+                await self.db_con.log_trade_to_db(
+                    current_data,
+                    indicator_values,
+                    float(stock_ltp),
+                    float(base_payload.stop_loss),
+                    float(base_payload.profit_level),
+                    direction,
+                    stock,
+                    metadata_json,
+                    qty=int(base_payload.quantity),
+                    order_status=True if self.test_mode else False,
+                    order_ids=[deal_reference] if deal_reference else [],
+                    stock_ltp=str(stock_ltp)
+                )
+
+            self.logger.info(f"{strategy_name}: High-accuracy trade executed for {stock}: {direction.value} (Confidence: {confidence_level:.2f})")
+        
+        finally:
+            # Restore original limit
+            self.stock_per_price_limit = original_limit
+
+    # Keep your existing helper methods (get_transformed_data, transform_data_to_1hour, etc.)
+    # but add the new quality calculation methods:
+
+    async def calculate_block_quality(self, data: pd.DataFrame, index: int, block_type: str) -> float:
+        """Calculate quality score for order blocks (0-1)"""
+        quality_factors = []
+        
+        # Factor 1: Volume significance
+        current_volume = data['volume'].iloc[index]
+        avg_volume = data['volume'].rolling(20).mean().iloc[index]
+        volume_factor = min(current_volume / avg_volume, 2.0) / 2.0  # Normalize to 0-1
+        quality_factors.append(volume_factor * 0.3)
+        
+        # Factor 2: Range significance
+        current_range = data['high'].iloc[index] - data['low'].iloc[index]
+        avg_range = (data['high'] - data['low']).rolling(20).mean().iloc[index]
+        range_factor = min(current_range / avg_range, 3.0) / 3.0  # Normalize to 0-1
+        quality_factors.append(range_factor * 0.3)
+        
+        # Factor 3: Follow-through
+        if block_type == 'bullish':
+            follow_through = data['close'].iloc[index+2] > data['close'].iloc[index]
+        else:
+            follow_through = data['close'].iloc[index+2] < data['close'].iloc[index]
+        quality_factors.append(0.4 if follow_through else 0.1)
+        
+        return sum(quality_factors)
+
+    async def calculate_zone_quality(self, data: pd.DataFrame, index: int, zone_type: str) -> float:
+        """Calculate quality score for supply/demand zones (0-1)"""
+        quality_factors = []
+        
+        # Factor 1: Wick length significance
+        candle = data.iloc[index]
+        candle_range = candle['high'] - candle['low']
+        
+        if zone_type == 'demand':
+            wick_length = min(candle['open'], candle['close']) - candle['low']
+        else:
+            wick_length = candle['high'] - max(candle['open'], candle['close'])
+        
+        wick_ratio = wick_length / candle_range
+        quality_factors.append(min(wick_ratio * 2, 1.0) * 0.4)  # Normalize to 0-1
+        
+        # Factor 2: Volume confirmation
+        current_volume = candle['volume']
+        avg_volume = data['volume'].rolling(20).mean().iloc[index]
+        volume_factor = min(current_volume / avg_volume, 2.0) / 2.0
+        quality_factors.append(volume_factor * 0.3)
+        
+        # Factor 3: Subsequent price reaction
+        if zone_type == 'demand':
+            reaction = data['low'].iloc[index+1] > candle['low'] and data['close'].iloc[index+2] > candle['close']
+        else:
+            reaction = data['high'].iloc[index+1] < candle['high'] and data['close'].iloc[index+2] < candle['close']
+        quality_factors.append(0.3 if reaction else 0.0)
+        
+        return sum(quality_factors)
+
+    async def analyze_supply_demand_zones_enhanced_v2(self, stock: str, timestamp: datetime) -> None:
+        """
+        Enhanced Supply/Demand strategy with multi-confirmation validation
+        """
+        stock_data_15min = await self.get_transformed_data(stock, timestamp, '15min', days=30)
+        stock_data_1hour = await self.get_transformed_data(stock, timestamp, '1hour', days=60)
+        
+        if stock_data_15min.empty or stock_data_1hour.empty:
+            return
+
+        zones = await self.identify_quality_zones(stock_data_15min, stock_data_1hour)
+        if not zones:
+            return
+
+        current_price = stock_data_15min['close'].iloc[-1]
+        current_data = stock_data_15min.iloc[-1]
+
+        for zone in zones[:3]:  # Check top 3 zones only
+            if await self.is_zone_reaction_with_confirmation(zone, current_price, current_data, stock_data_15min):
+                direction = CapitalTransactionType.BUY if zone['type'] == 'demand' else CapitalTransactionType.SELL
+                
+                # Get multiple confirmations
+                confirmations = await self.get_zone_confirmations(zone, stock_data_15min, direction)
+                
+                # Only trade with sufficient confirmations (adjust threshold as needed)
+                if confirmations >= 3:  # Require 3+ confirmations for high probability
+                    confidence = 0.6 + (confirmations * 0.1)  # 0.7-0.9 confidence
+                    await self.execute_high_accuracy_trade(
+                        stock, stock_data_15min, direction, 
+                        f"SUPPLY_DEMAND_CONF{confirmations}", timestamp, confidence
+                    )
+                    return  # Take only one high-confidence trade
+
+    async def is_zone_reaction_with_confirmation(self, zone: dict, current_price: float, 
+                                            current_candle: pd.Series, stock_data: pd.DataFrame) -> bool:
+        """
+        Enhanced zone reaction check with price and volume validation
+        """
+        zone_price = zone['price_level']
+        
+        # Check if price is at zone level (within 0.2%)
+        price_at_zone = abs(current_price - zone_price) / zone_price < 0.002
+        
+        if not price_at_zone:
+            return False
+
+        # Enhanced volume confirmation
+        current_volume = current_candle['volume']
+        avg_volume = stock_data['volume'].rolling(20).mean().iloc[-1]
+        volume_confirm = current_volume > avg_volume * 1.3
+
+        return volume_confirm
+
+    async def get_zone_confirmations(self, zone: dict, stock_data_15min: pd.DataFrame, direction: CapitalTransactionType) -> int:
+        """
+        Calculate confirmation score for zone reactions using multiple technical factors.
+        Returns: Number of confirmations (0-5) - recommend requiring >= 2 for trading
+        """
+        confirmation_count = 0
+        
+        # 1. Price Action Confirmation
+        if await self._check_price_action_confirmation(stock_data_15min, direction):
+            confirmation_count += 1
+            self.logger.debug("Price action confirmation passed")
+        
+        # 2. Volume Confirmation  
+        if await self._check_volume_confirmation(stock_data_15min):
+            confirmation_count += 1
+            self.logger.debug("Volume confirmation passed")
+        
+        # 3. Momentum Indicator Confirmation
+        if await self._check_momentum_confirmation(stock_data_15min, direction):
+            confirmation_count += 1
+            self.logger.debug("Momentum confirmation passed")
+        
+        # 4. Multi-Timeframe Alignment
+        if await self._check_multi_tf_alignment(zone, direction):
+            confirmation_count += 1
+            self.logger.debug("Multi-timeframe alignment passed")
+        
+        # 5. Market Structure Confirmation
+        if await self._check_market_structure_confirmation(stock_data_15min, direction):
+            confirmation_count += 1
+            self.logger.debug("Market structure confirmation passed")
+        
+        self.logger.info(f"Zone confirmation score: {confirmation_count}/5 for {direction.value}")
+        return confirmation_count
+
+    async def _check_price_action_confirmation(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm with candlestick patterns and price behavior"""
+        current_candle = stock_data.iloc[-1]
+        prev_candle = stock_data.iloc[-2]
+        
+        # Check for rejection candlestick patterns :cite[3]:cite[8]
+        if direction == CapitalTransactionType.BUY:
+            # Bullish confirmation: Hammer-like patterns, close near high
+            body = abs(current_candle['close'] - current_candle['open'])
+            lower_wick = min(current_candle['open'], current_candle['close']) - current_candle['low']
+            upper_wick = current_candle['high'] - max(current_candle['open'], current_candle['close'])
+            
+            return (
+                (lower_wick > body * 1.5) or  # Long lower wick
+                (current_candle['close'] > current_candle['open'] and  # Bullish candle
+                (current_candle['close'] - current_candle['low']) / (current_candle['high'] - current_candle['low']) > 0.6)  # Close in upper 60%
+            )
+        else:
+            # Bearish confirmation: Shooting star-like patterns, close near low
+            body = abs(current_candle['close'] - current_candle['open'])
+            upper_wick = current_candle['high'] - max(current_candle['open'], current_candle['close'])
+            lower_wick = min(current_candle['open'], current_candle['close']) - current_candle['low']
+            
+            return (
+                (upper_wick > body * 1.5) or  # Long upper wick
+                (current_candle['close'] < current_candle['open'] and  # Bearish candle
+                (current_candle['high'] - current_candle['close']) / (current_candle['high'] - current_candle['low']) > 0.6)  # Close in lower 60%
+            )
+
+    async def _check_volume_confirmation(self, stock_data: pd.DataFrame) -> bool:
+        """Confirm with volume spike :cite[10]"""
+        if len(stock_data) < 20:
+            return False
+        
+        current_volume = stock_data['volume'].iloc[-1]
+        volume_sma = stock_data['volume'].rolling(window=20).mean().iloc[-1]
+        
+        # Volume should be significantly higher than average
+        return current_volume > volume_sma * 1.5
+
+    async def _check_momentum_confirmation(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm with RSI and ADX momentum indicators :cite[10]"""
+        rsi = await self.calculate_rsi_talib(stock_data)
+        adx = await self.calculate_adx_talib(stock_data)
+        
+        if direction == CapitalTransactionType.BUY:
+            # For buys: RSI not overbought, ADX shows trend strength
+            return (40 <= rsi <= 70) and (adx > 20)
+        else:
+            # For sells: RSI not oversold, ADX shows trend strength  
+            return (30 <= rsi <= 60) and (adx > 20)
+
+    async def _check_multi_tf_alignment(self, zone: dict, direction: CapitalTransactionType) -> bool:
+        """Check higher timeframe alignment :cite[2]"""
+        try:
+            # Get higher timeframe data (1-hour)
+            stock_data_1hour = await self.get_transformed_data(
+                zone.get('stock', ''), 
+                pd.Timestamp.now(), 
+                '1hour', 
+                days=5
+            )
+            
+            if stock_data_1hour.empty:
+                return False
+            
+            # Simple check: is the higher timeframe trend aligned?
+            current_hour_close = stock_data_1hour['close'].iloc[-1]
+            hour_sma_20 = stock_data_1hour['close'].rolling(20).mean().iloc[-1]
+            
+            if direction == CapitalTransactionType.BUY:
+                return current_hour_close >= hour_sma_20
+            else:
+                return current_hour_close <= hour_sma_20
+                
+        except Exception as e:
+            self.logger.warning(f"Multi-TF alignment check failed: {e}")
+            return False
+
+    async def _check_market_structure_confirmation(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm market structure supports the trade"""
+        if len(stock_data) < 10:
+            return False
+        
+        # Check for recent higher highs/lows for bullish, lower highs/lows for bearish
+        recent_highs = stock_data['high'].tail(5)
+        recent_lows = stock_data['low'].tail(5)
+        
+        if direction == CapitalTransactionType.BUY:
+            # For buys: look for structure suggesting upward momentum
+            return recent_highs.iloc[-1] > recent_highs.iloc[-2]
+        else:
+            # For sells: look for structure suggesting downward momentum  
+            return recent_lows.iloc[-1] < recent_lows.iloc[-2]

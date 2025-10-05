@@ -7,7 +7,7 @@
         "holidays": [],
         "leverage": "200:1",
         "sl_perc": 0.0035,
-        "qty": "1",
+        "qty": "250",
         "orb_enabled": false
     },
     "US100": {
@@ -29,7 +29,7 @@
         ],
         "leverage": "200:1",
         "sl_perc": 0.006,
-        "qty": "0.2",
+        "qty": "0.7",
         "orb_enabled": true
     },
     "GOLD": {
@@ -41,7 +41,7 @@
         "leverage": "200:1",
         "sl": "7.5",
         "sl_perc": 0.006,
-        "qty": "1",
+        "qty": "15",
         "orb_enabled": true
     },
     "J225": {
@@ -73,7 +73,7 @@
         ],
         "leverage": "200:1",
         "sl_perc": 0.006,
-        "qty": "1",
+        "qty": "10",
         "orb_enabled": false
     },
     "US30": {
@@ -97,7 +97,7 @@
         "sl": "50",
         "pl": "100",
         "sl_perc": 0.002,
-        "qty": "0.2",
+        "qty": "0.4",
         "orb_enabled": true
     },
     "BTCUSD": {
@@ -152,7 +152,7 @@
         "holidays": [],
         "leverage": "200:1",
         "sl_perc": 0.006,
-        "qty": "24000",
+        "qty": "2400",
         "orb_enabled": false
     }
 }
