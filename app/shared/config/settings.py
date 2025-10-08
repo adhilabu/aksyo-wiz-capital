@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     MIGRATIONS_FILE: str = "D:/projects/aksyo-wiz/app/sql/migrations.sql"    
     SL_PERC: float = 0.004  # 1% stop loss
     LOG_TRADE_TO_DB: bool = False
+    RISK_REWARD_RATIO: float = 1.2
 
 
     class Config:
