@@ -2919,6 +2919,48 @@ class StockIndicatorCalculator:
                     confidence_level=0.8
                 )
 
+    async def confirm_volume_pattern(self, data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """
+        Confirm volume pattern for trade direction with multiple volume-based validations.
+        
+        Parameters:
+        - data: DataFrame with OHLCV data
+        - direction: BUY or SELL direction
+        
+        Returns:
+        - bool: True if volume pattern confirms the direction
+        """
+        if len(data) < 20:
+            return False
+        
+        try:
+            current_volume = data['volume'].iloc[-1]
+            prev_volume = data['volume'].iloc[-2]
+            
+            # Calculate volume indicators
+            volume_sma_20 = data['volume'].rolling(window=20).mean().iloc[-1]
+            volume_ratio = current_volume / volume_sma_20 if volume_sma_20 > 0 else 1.0
+            
+            # Volume spike confirmation (current volume > 1.5x 20-period average)
+            volume_spike = volume_ratio > 1.5
+            
+            # Volume trend (current volume > previous volume)
+            volume_increasing = current_volume > prev_volume
+            
+            # Volume confirmation based on direction
+            if direction == CapitalTransactionType.BUY:
+                # For BUY: Look for volume expansion on up moves
+                price_increasing = data['close'].iloc[-1] > data['open'].iloc[-1]
+                return volume_spike and (volume_increasing or price_increasing)
+            else:
+                # For SELL: Look for volume expansion on down moves  
+                price_decreasing = data['close'].iloc[-1] < data['open'].iloc[-1]
+                return volume_spike and (volume_increasing or price_decreasing)
+                
+        except Exception as e:
+            self.logger.warning(f"Volume pattern confirmation error: {str(e)}")
+            return False
+
     async def analyze_supply_demand_zones_v2(self, stock: str, timestamp: datetime) -> None:
         """
         Supply and Demand zone strategy with institutional confirmation
@@ -3294,37 +3336,91 @@ class StockIndicatorCalculator:
         
         return sum(quality_factors)
 
+    # async def calculate_zone_quality(self, data: pd.DataFrame, index: int, zone_type: str) -> float:
+    #     """Calculate quality score for supply/demand zones (0-1)"""
+    #     quality_factors = []
+        
+    #     # Factor 1: Wick length significance
+    #     candle = data.iloc[index]
+    #     candle_range = candle['high'] - candle['low']
+        
+    #     if zone_type == 'demand':
+    #         wick_length = min(candle['open'], candle['close']) - candle['low']
+    #     else:
+    #         wick_length = candle['high'] - max(candle['open'], candle['close'])
+        
+    #     wick_ratio = wick_length / candle_range
+    #     quality_factors.append(min(wick_ratio * 2, 1.0) * 0.4)  # Normalize to 0-1
+        
+    #     # Factor 2: Volume confirmation
+    #     current_volume = candle['volume']
+    #     avg_volume = data['volume'].rolling(20).mean().iloc[index]
+    #     volume_factor = min(current_volume / avg_volume, 2.0) / 2.0
+    #     quality_factors.append(volume_factor * 0.3)
+        
+    #     # Factor 3: Subsequent price reaction
+    #     if zone_type == 'demand':
+    #         reaction = data['low'].iloc[index+1] > candle['low'] and data['close'].iloc[index+2] > candle['close']
+    #     else:
+    #         reaction = data['high'].iloc[index+1] < candle['high'] and data['close'].iloc[index+2] < candle['close']
+    #     quality_factors.append(0.3 if reaction else 0.0)
+        
+    #     return sum(quality_factors)
+
     async def calculate_zone_quality(self, data: pd.DataFrame, index: int, zone_type: str) -> float:
         """Calculate quality score for supply/demand zones (0-1)"""
         quality_factors = []
         
-        # Factor 1: Wick length significance
-        candle = data.iloc[index]
-        candle_range = candle['high'] - candle['low']
+        try:
+            # Factor 1: Wick length significance
+            candle = data.iloc[index]
+            candle_range = candle['high'] - candle['low']
+            
+            # Handle zero-range candles
+            if candle_range <= 0:
+                wick_ratio = 0.0
+            else:
+                if zone_type == 'demand':
+                    wick_length = min(candle['open'], candle['close']) - candle['low']
+                else:
+                    wick_length = candle['high'] - max(candle['open'], candle['close'])
+                
+                wick_ratio = wick_length / candle_range
+            
+            quality_factors.append(min(wick_ratio * 2, 1.0) * 0.4)  # Normalize to 0-1
+            
+            # Factor 2: Volume confirmation with NaN/zero protection
+            current_volume = candle['volume']
+            avg_volume = data['volume'].rolling(20, min_periods=1).mean().iloc[index]
+            
+            # Handle zero/NaN average volume
+            if pd.isna(avg_volume) or avg_volume <= 0:
+                volume_factor = 0.5  # Neutral factor when volume data is unavailable
+            else:
+                volume_ratio = current_volume / avg_volume
+                volume_factor = min(volume_ratio, 2.0) / 2.0
+            
+            quality_factors.append(volume_factor * 0.3)
+            
+            # Factor 3: Subsequent price reaction with bounds checking
+            if index + 2 < len(data):
+                if zone_type == 'demand':
+                    reaction = (data['low'].iloc[index+1] > candle['low'] and 
+                            data['close'].iloc[index+2] > candle['close'])
+                else:
+                    reaction = (data['high'].iloc[index+1] < candle['high'] and 
+                            data['close'].iloc[index+2] < candle['close'])
+                quality_factors.append(0.3 if reaction else 0.0)
+            else:
+                # Not enough future data to assess reaction
+                quality_factors.append(0.0)
+            
+            return sum(quality_factors)
         
-        if zone_type == 'demand':
-            wick_length = min(candle['open'], candle['close']) - candle['low']
-        else:
-            wick_length = candle['high'] - max(candle['open'], candle['close'])
-        
-        wick_ratio = wick_length / candle_range
-        quality_factors.append(min(wick_ratio * 2, 1.0) * 0.4)  # Normalize to 0-1
-        
-        # Factor 2: Volume confirmation
-        current_volume = candle['volume']
-        avg_volume = data['volume'].rolling(20).mean().iloc[index]
-        volume_factor = min(current_volume / avg_volume, 2.0) / 2.0
-        quality_factors.append(volume_factor * 0.3)
-        
-        # Factor 3: Subsequent price reaction
-        if zone_type == 'demand':
-            reaction = data['low'].iloc[index+1] > candle['low'] and data['close'].iloc[index+2] > candle['close']
-        else:
-            reaction = data['high'].iloc[index+1] < candle['high'] and data['close'].iloc[index+2] < candle['close']
-        quality_factors.append(0.3 if reaction else 0.0)
-        
-        return sum(quality_factors)
-
+        except (KeyError, IndexError, ZeroDivisionError) as e:
+            self.logger.warning(f"Error calculating zone quality at index {index}: {e}")
+            return 0.0  # Return minimum quality on error
+            
     async def analyze_supply_demand_zones_enhanced_v2(self, stock: str, timestamp: datetime) -> None:
         """
         Enhanced Supply/Demand strategy with multi-confirmation validation
