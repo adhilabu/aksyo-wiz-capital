@@ -37,6 +37,7 @@ NIFTY_50_SYMBOL = 'NSE_INDEX|Nifty 50'
 SPLIT_TYPE = int(os.getenv("SPLIT_TYPE", "1"))
 TRADE_PERC = float(os.getenv("TRADE_PERC", 0.006))
 SL_PERC = float(os.getenv("SL_PERC", 0.01))
+RISK_REWARD_RATIO = float(os.getenv("RISK_REWARD_RATIO", 1.2))
 LOG_TRADE_TO_DB = os.getenv("LOG_TRADE_TO_DB", "False").lower() == "true"
 LOG_TRADE_TO_DB = CAPITAL_SETTINGS.LOG_TRADE_TO_DB
 
@@ -1128,7 +1129,7 @@ class StockIndicatorCalculator:
 
         # Calculate desired PL with risk-reward ratio
         risk = abs(entry_price - stop_loss)
-        reward = risk * 1.5  # 1:1.5 risk-reward ratio
+        reward = risk * RISK_REWARD_RATIO  # 1:1.2 risk-reward ratio
         
         if direction == CapitalTransactionType.BUY:
             desired_pl = entry_price + reward
