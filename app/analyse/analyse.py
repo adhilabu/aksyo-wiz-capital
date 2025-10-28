@@ -24,6 +24,7 @@ from app.shared.config.settings import CAPITAL_SETTINGS
 from app.utils.logger import setup_logger
 from app.utils.utils import get_logging_level
 from fastapi import BackgroundTasks
+from app.analyse.sentiment_trader import SentimentTrader
 load_dotenv(dotenv_path=".env", override=True) 
 
 LOGGING_LEVEL = get_logging_level()
@@ -49,10 +50,10 @@ class StockIndicatorCalculator:
     TRADE_PERC = TRADE_PERC
     SL_PERC = SL_PERC
     MAX_ADJUSTMENTS = 3
-    TOTAL_TRADES_LIMIT = 30
+    TOTAL_TRADES_LIMIT = 40
     OPEN_TRADES_LIMIT = 15
     LOSS_TRADE_LIMIT = 5
-    STOCK_TRADE_LIMIT = 3
+    STOCK_TRADE_LIMIT = 5
 
     def __init__(self, db_connection: DBConnection, redis_cache: RedisCache, start_date=None, end_date=None, test_mode=False):
         self.db_con: DBConnection = db_connection
@@ -71,6 +72,7 @@ class StockIndicatorCalculator:
         self.stock_name_map = {}
         self.stock_per_price_limit = float(STOCK_PER_PRICE_LIMIT)
         self.market_details = None
+        self.sentiment_trader = SentimentTrader()
 
     def set_and_get_dates(self, for_historical_data=False):
         self.db_con.end_date = self.end_date
@@ -115,33 +117,10 @@ class StockIndicatorCalculator:
                     await self.update_stock_data_v2(row)
             except Exception as e:
                 self.logger.error(f"Error processing row: {e}")
-        # for _, row in transformed_data.iterrows():
-        #     await self.update_stock_data_v2(row)
         tasks = [self.update_stock_data_v2(row) for _, row in transformed_data.iterrows()]
         await asyncio.gather(*tasks)
         timestamp = transformed_data.iloc[0]['timestamp'] if len(transformed_data) > 0 else 'Empty'
         self.logger.info(f"Inserted data for timestamp: {timestamp}.")
-
-    async def update_stock_data(self, data: pd.Series):
-        stock = data['stock']
-        timestamp = pd.to_datetime(data['timestamp'])
-        existing_timestamps = await self.db_con.fetch_existing_timestamps(stock)
-        if timestamp in existing_timestamps:
-            await self.db_con.update_stock_data_for_historical_data_v2(data)
-            return
-
-        self.logger.info(f"Inserting data for stock: {stock} and timestamp: {timestamp}.")
-        await self.db_con.save_data_to_db(data.to_frame().T)
-
-        await asyncio.gather(
-            self.analyze_mean_reversion_strategy(stock),
-            self.analyze_ma_crossover_strategy_type_2(stock),
-            self.analyze_sma_strategy_type_2(stock),
-            self.analyze_sma_macd_crossover_strategy(stock),
-            self.analyze_reversal_breakout_strategy(stock, timestamp),
-            self.analyze_sma_strategy_type_1(stock),
-        )
-    
 
     async def get_stock_ltp(self, stock, current_price):
         stock_ltp = await self.db_con.fetch_stock_ltp_from_db(stock) or current_price
@@ -374,6 +353,21 @@ class StockIndicatorCalculator:
             return np.float64(0.0)
         rsi = stream.RSI(stock_data['close'].astype(float).values, timeperiod=period)
         return rsi if rsi else 0
+
+    async def calculate_macd_talib(self, stock_data: pd.DataFrame, fastperiod=12, slowperiod=26, signalperiod=9) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        if len(stock_data) < slowperiod:
+            return None, None, None
+        
+        macd, macdsignal, macdhist = talib.MACD(
+            stock_data['close'].astype(float).values,
+            fastperiod=fastperiod,
+            slowperiod=slowperiod,
+            signalperiod=signalperiod
+        )
+        
+        return macd[-1] if macd is not None and len(macd) > 0 else None, \
+               macdsignal[-1] if macdsignal is not None and len(macdsignal) > 0 else None, \
+               macdhist[-1] if macdhist is not None and len(macdhist) > 0 else None
     
     async def calculate_vwap_finta(self, stock_data: pd.DataFrame) -> np.float64:
         vwap_data = stock_data[['close', 'high', 'low', 'volume', 'open']]
@@ -693,6 +687,132 @@ class StockIndicatorCalculator:
 
         index_data: pd.DataFrame = await self.db_con.load_data_from_db(index, start_date, end_date)
         return await self.transform_1_min_data_to_5_min_data(index, index_data)
+
+    async def identify_orb_and_fib_trade(self, stock: str, timestamp, orb_minutes: int = 30):
+        stock_data_5_min = await self.get_transformed_data(stock, timestamp, '5min', days=7)
+        if stock_data_5_min.empty or len(stock_data_5_min) < 2:
+            return
+
+        stock = stock_data_5_min['stock'].iloc[-1]
+        market_config = self.market_details.get(stock, {})
+        if not market_config:
+            self.logger.warning(f"No market config for {stock}, skipping ORB strategy.")
+            return
+
+        # 1. Determine Opening Range
+        tz = pytz.timezone(market_config["timezone"])
+        today_utc = stock_data_5_min['timestamp'].iloc[-1].date()
+        
+        session_start_str = market_config.get("session1_start", market_config.get("open"))
+        if not session_start_str:
+            return
+
+        market_open_time = datetime.strptime(session_start_str, "%H:%M").time()
+        market_open_datetime_local = tz.localize(datetime.combine(today_utc, market_open_time))
+        orb_end_datetime_local = market_open_datetime_local + timedelta(minutes=orb_minutes)
+
+        today_data_local = stock_data_5_min.set_index('timestamp').tz_localize('UTC').tz_convert(tz)
+        today_data_local = today_data_local[today_data_local.index.date == today_data_local.index.date[-1]]
+
+        orb_data = today_data_local[(today_data_local.index >= market_open_datetime_local) & (today_data_local.index <= orb_end_datetime_local)]
+
+        if orb_data.empty:
+            return # Not in the ORB period yet
+
+        orb_high = orb_data['high'].max()
+        orb_low = orb_data['low'].min()
+
+        # 2. Check for Breakout
+        current_candle = today_data_local.iloc[-1]
+        previous_candle = today_data_local.iloc[-2]
+        breakout_direction = None
+
+        # Check for upward breakout
+        if current_candle['close'] > orb_high and previous_candle['close'] <= orb_high:
+            breakout_direction = 'long'
+        # Check for downward breakout
+        elif current_candle['close'] < orb_low and previous_candle['close'] >= orb_low:
+            breakout_direction = 'short'
+
+        if not breakout_direction:
+            return # No breakout yet
+
+        # 3. Wait for Pullback and Calculate Fibonacci Levels
+        session_high = today_data_local['high'].max()
+        session_low = today_data_local['low'].min()
+
+        if breakout_direction == 'long':
+            fib_level_50 = session_high - 0.5 * (session_high - session_low)
+            fib_level_618 = session_high - 0.618 * (session_high - session_low)
+            entry_price_target = max(fib_level_50, fib_level_618)
+            stop_loss = session_low # Or below 78.6% level
+            profit_target = session_high + (session_high - session_low) # Example target
+
+            if not (fib_level_618 <= current_candle['close'] <= fib_level_50):
+                return
+
+        else: # short
+            fib_level_50 = session_low + 0.5 * (session_high - session_low)
+            fib_level_618 = session_low + 0.618 * (session_high - session_low)
+            entry_price_target = min(fib_level_50, fib_level_618)
+            stop_loss = session_high
+            profit_target = session_low - (session_high - session_low)
+
+            if not (fib_level_50 <= current_candle['close'] <= fib_level_618):
+                return
+
+        # 4. MACD Confirmation
+        macd, macdsignal, _ = await self.calculate_macd_talib(today_data_local.reset_index())
+        if macd is None or macdsignal is None:
+            return
+
+        if breakout_direction == 'long' and not (macd > macdsignal):
+            return # MACD confirmation failed
+        if breakout_direction == 'short' and not (macd < macdsignal):
+            return # MACD confirmation failed
+
+        # 5. Execute Trade
+        open_trades = await self._fetch_open_trades(stock, current_candle.name)
+        if open_trades:
+            self.logger.info(f"Skipping trade for {stock} as there are already open positions.")
+            return
+
+        trade_type = CapitalTransactionType.BUY if breakout_direction == 'long' else CapitalTransactionType.SELL
+        size = self.stock_per_price_limit / entry_price_target
+
+        order = BasicPlaceOrderCapital(
+            epic=stock,
+            level=entry_price_target,
+            size=round(size, 2),
+            type=CapitalOrderType.LIMIT,
+            transaction_type=trade_type,
+            stop_level=stop_loss,
+            profit_level=profit_target
+        )
+
+        try:
+            deal_reference = await self.capital_client.place_order(order)
+            if deal_reference:
+                self.logger.info(f"Successfully placed {breakout_direction} order for {stock} at {entry_price_target:.2f}. Deal Reference: {deal_reference}")
+                trade_data = {
+                    "stock": stock,
+                    "ltp": current_candle['close'],
+                    "cp": current_candle['close'],
+                    "entry_price": entry_price_target,
+                    "sl": stop_loss,
+                    "pl": profit_target,
+                    "timestamp": current_candle.name.to_pydatetime(),
+                    "trade_type": trade_type.value,
+                    "status": TradeStatus.OPEN.value,
+                    "indicator_values": {},
+                    "metadata_json": {"deal_reference": deal_reference, "strategy": "ORB_FIB"}
+                }
+                await self.db_con.insert_trade_to_db(trade_data)
+            else:
+                self.logger.error(f"Failed to place {breakout_direction} order for {stock}.")
+        except Exception as e:
+            self.logger.error(f"Error placing order for {stock}: {e}", exc_info=True)
+
 
     async def identify_candle_color_reversal(self, stock_data_5_min):
         """Identifies the first candle color reversal and tracks breakout status."""
@@ -1129,9 +1249,9 @@ class StockIndicatorCalculator:
         # Existing checks remain unchanged
         # await self.check_and_execute_exit_trade_type_2(final_stock_data)
         # await self.update_open_trades_status(stock_data)
-        if stock in self.executed_breakouts and self.executed_breakouts[stock]:
-            self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
-            return
+        # if stock in self.executed_breakouts and self.executed_breakouts[stock]:
+        #     self.logger.info(f"{stock}: Breakout already executed today. Skipping.")
+        #     return
     
         if (final_timestamp.minute + 1) % 5 != 0:
             return
@@ -1253,12 +1373,6 @@ class StockIndicatorCalculator:
         # Set TTL for the stock timestamp key (100 seconds)
         self.redis_cache.client.expire(stock_ts_key, 30)
 
-        await self.send_telegram_notification(final_stock_data, indicator_values, broken_level, base_payload.stop_loss, base_payload.profit_level, breakout_direction, "REVERSAL_BREAKOUT")
-        # Momentum check
-        # if self.is_invalid_momentum_trade(indicator_values):
-        #     self.logger.info("HN: Invalid momentum indicators. Skipping.")
-        #     return
-
         # Check existing open trades
         if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
             self.logger.info("HN: Max open trades reached for stock. Skipping.")
@@ -1281,358 +1395,20 @@ class StockIndicatorCalculator:
             return
         
 
-        metadata_json = {
-            "atr": atr
-        }
-
-        deal_reference = await self.capital_client.place_order(base_payload)
-        if LOG_TRADE_TO_DB:
-            await self.db_con.log_trade_to_db(
-                final_stock_data,
-                indicator_values,
-                float(broken_level),
-                float(base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance),
-                float(base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance),
-                breakout_direction,
-                stock,
-                metadata_json,
-                qty=int(base_payload.quantity),
-                order_status=True if self.test_mode else False,
-                order_ids=[deal_reference] if deal_reference else [],
-                stock_ltp=str(stock_ltp)
+        if breakout_direction and not already_broken:
+            confidence = 0.7  # Base confidence for reversal breakout
+            if index_confirmation:
+                confidence += 0.1
+            
+            await self.execute_high_accuracy_trade(
+                stock=stock,
+                stock_data=stock_data,
+                direction=breakout_direction,
+                strategy_name="REVERSAL_BREAKOUT",
+                timestamp=current_timestamp,
+                confidence_level=confidence
             )
 
-        self.logger.info(f"HN : High-probability trade executed for {stock}: ")
-
-
-    async def analyze_sma_strategy_type_1(self, stock) -> None:
-        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=HISTORY_DATA_PERIOD), self.end_date)
-        if stock_data.empty:
-            return
-        
-        #  order by timestamp
-        stock_data = stock_data.sort_values(by='timestamp', ascending=True)
-        final_stock_data = stock_data.iloc[-1]
-        current_timestamp = stock_data.iloc[-1]['timestamp']
-        # Existing checks remain unchanged
-        # await self.update_open_trades_status(stock_data)        
-        # open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
-        # if open_results:
-        #     self.logger.info(f"SMA: {stock}: Condition met, skipping trade")
-        #     return
-        
-        current_price = final_stock_data['ltp']
-        breakout_direction = None
-
-        if stock_data.empty or len(stock_data) < 200:
-            self.logger.info(f"SMA: {stock}: Insufficient data to calculate SMAs. Skipping.")
-            return
-
-        # Calculate 13-period and 200-period SMAs using closing prices
-        # Calculate SMA with partial window initialization
-        stock_data['sma13'] = stock_data['close'].rolling(window=13, min_periods=1).mean()
-        stock_data['sma200'] = stock_data['close'].rolling(window=200, min_periods=1).mean()
-
-        # Extract latest SMA values and closing price
-        sma13 = stock_data['sma13'].iloc[-1]
-        sma200 = stock_data['sma200'].iloc[-1]
-        latest_close = final_stock_data['close']
-        prev_sma13 = stock_data['sma13'].iloc[-2]
-        prev_high = stock_data['high'].iloc[-2]
-        prev_low = stock_data['low'].iloc[-2]
-        prev_high_2 = stock_data['high'].iloc[-3]
-        prev_low_2 = stock_data['low'].iloc[-3]
-        prev_sma13_2 = stock_data['sma13'].iloc[-3]
-        prev_high_3 = stock_data['high'].iloc[-4]
-        prev_low_3 = stock_data['low'].iloc[-4]
-        prev_sma13_3 = stock_data['sma13'].iloc[-4]
-        
-        # Check if SMAs are valid (not NaN)
-        if pd.isna(sma13) or pd.isna(sma200):
-            self.logger.info(f"SMA: {stock}: Insufficient data to calculate SMAs. Skipping.")
-            return
-
-        breakout_direction = None
-        broken_level = sma13
-
-        if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13 and prev_high_2 < prev_sma13_2 and prev_high_3 < prev_sma13_3:
-        # if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13:
-            breakout_direction = CapitalTransactionType.BUY
-        elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13 and prev_low_2 > prev_sma13_2 and prev_low_3 > prev_sma13_3:
-        # elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13:
-            breakout_direction = CapitalTransactionType.SELL
-        else:
-            self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
-            return
-
-        # pivot_broken, broken_level = await self.last_close_price_broke_resistance(stock_data, breakout_direction)
-        # if not pivot_broken:
-        #     self.logger.info(f"SMA: stock: Didn't broke any pivot levels")
-        #     return
-
-        # Determine SL and PL based on breakout direction
-        stock_ltp = await self.get_stock_ltp(stock, current_price)
-        # Prepare order payload
-        order_type = CapitalOrderType.MARKET
-        base_payload = await self.get_base_payload_for_capital_order(
-            epic=stock,
-            stock_ltp=stock_ltp,
-            trans_type=breakout_direction,
-            order_type=order_type,
-            timestamp=current_timestamp,
-            stock_data=stock_data
-        )
-        
-        if not base_payload:
-            return
-        
-        await asyncio.sleep(random.uniform(0, 1))
-
-        # Redis key for stock timestamp validation
-        stock_ts_key = f"order:{stock}:{current_timestamp}"
-
-        # Check if this stock timestamp combination already exists
-        if not self.redis_cache.client.setnx(stock_ts_key, 1):
-            return  # Exit if key already exists
-
-        # Set TTL for the stock timestamp key (100 seconds)
-        self.redis_cache.client.expire(stock_ts_key, 30)
-
-        if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
-            self.logger.info("HN: Max open trades reached for stock. Skipping.")
-            # self.redis_cache.client.delete(stock_ts_key)
-            # self.redis_cache.client.decr(ts_count_key)
-            return
-
-
-        # Check open trade limits
-        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("SMA: Max open trades reached. Skipping.")
-            return
-
-        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
-            self.logger.info("SMA: Max loss trades reached. Skipping.")
-            return
-        
-        # Calculate momentum indicators
-        rsi, adx, mfi = await asyncio.gather(
-            self.calculate_rsi_talib(stock_data),
-            self.calculate_adx_talib(stock_data),
-            self.calculate_mfi_talib(stock_data)
-        )
-        
-        indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
-        await self.send_telegram_notification(
-            final_stock_data,
-            indicator_values,
-            float(broken_level),
-            float(base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance),
-            float(base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance),
-            breakout_direction,
-            "SMA_STRATEGY"
-        )
-
-        # Prepare metadata including ATR and SMAs
-        metadata_json = {
-            "sma13": sma13,
-            "sma200": sma200
-        }
-
-        # Place order and log trade
-        deal_reference = await self.capital_client.place_order(base_payload)
-        if LOG_TRADE_TO_DB:
-            await self.db_con.log_trade_to_db(
-                final_stock_data,
-                indicator_values,
-                float(broken_level),
-                float(base_payload.stop_loss if order_type != CapitalOrderType.MARKET else base_payload.stop_distance),
-                float(base_payload.profit_level if order_type != CapitalOrderType.MARKET else base_payload.profit_distance),
-                breakout_direction,
-                stock,
-                metadata_json,
-                qty=int(base_payload.quantity),
-                order_status=True if self.test_mode else False,
-                order_ids=[deal_reference] if deal_reference else [],
-                stock_ltp=str(stock_ltp)
-            )
-
-        self.logger.info(f"SMA: High-probability trade executed for {stock}: Direction {breakout_direction.value}")
-
-    async def analyze_sma_macd_crossover_strategy(self, stock) -> None:
-        """
-        Implements RSI + MACD crossover strategy on 15-minute timeframes.
-        Entry conditions:
-        Long: RSI < 30 (oversold) + MACD crosses above Signal
-        Short: RSI > 70 (overbought) + MACD crosses below Signal
-        """
-        # Load historical data for the past 5 days to ensure enough data for calculations
-        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(
-            stock, 
-            self.end_date - timedelta(days=5), 
-            self.end_date
-        )
-
-        # sort by timestamp
-        if stock_data.empty:
-            return
-
-        # Sort data by timestamp
-        stock_data = stock_data.sort_values(by='timestamp', ascending=True)
-        final_stock_data = stock_data.iloc[-1]
-        current_timestamp = final_stock_data['timestamp']
-
-        # continue if current_timestamp + 1 is not in the multiple of 15 minutes
-        if (current_timestamp + timedelta(minutes=1)).minute % 15 != 0:
-            return
-
-        # Update existing trades and check limits
-        # await self.update_open_trades_status(stock_data)
-        # open_results = await self.db_con.get_open_trade_stats(stock, open_count=self.OPEN_TRADES_LIMIT)
-        # if open_results:
-        #     self.logger.info(f"MACD: {stock}: Max open trades reached, skipping")
-        #     return
-
-        # Transform 1-minute data to 15-minute timeframe
-        stock_data_15min = await self.transform_data_to_15min(stock, stock_data)
-        if len(stock_data_15min) < 35:  # Need enough data for indicators
-            return
-
-        # Calculate RSI
-        rsi = talib.RSI(stock_data_15min['close'].values, timeperiod=14)
-        
-        # Calculate MACD
-        macd, signal, hist = talib.MACD(
-            stock_data_15min['close'].values,
-            fastperiod=12,
-            slowperiod=26,
-            signalperiod=9
-        )
-
-        # Get current and previous values
-        current_rsi = rsi[-1]
-        prev_rsi = rsi[-2]
-        current_macd = macd[-1]
-        current_signal = signal[-1]
-        prev_macd = macd[-2]
-        prev_signal = signal[-2]
-
-        # Determine trade direction based on conditions
-        breakout_direction = None
-        if (current_rsi < 30 and prev_rsi < 30 and 
-            current_macd > current_signal and prev_macd <= prev_signal):
-            breakout_direction = CapitalTransactionType.BUY
-        elif (current_rsi > 70 and prev_rsi > 70 and 
-              current_macd < current_signal and prev_macd >= prev_signal):
-            breakout_direction = CapitalTransactionType.SELL
-        else:
-            self.logger.info(f"MACD: {stock}: No valid crossover conditions met. Skipping.")
-            return
-
-        # Get current price and prepare order
-        current_price = final_stock_data['ltp']
-        stock_ltp = await self.get_stock_ltp(stock, current_price)
-
-        # Custom take profit and stop loss percentages
-        # tp_percentage = 0.0007  # 0.07%
-        # sl_percentage = 0.00051  # 0.051%
-
-        # # Calculate take profit and stop loss levels
-        # if breakout_direction == CapitalTransactionType.BUY:
-        #     take_profit = stock_ltp * (1 + tp_percentage)
-        #     stop_loss = stock_ltp * (1 - sl_percentage)
-        # else:
-        #     take_profit = stock_ltp * (1 - tp_percentage)
-        #     stop_loss = stock_ltp * (1 + sl_percentage)
-
-        # Prepare order payload with custom TP/SL
-        base_payload = await self.get_base_payload_for_capital_order(
-            epic=stock,
-            stock_ltp=stock_ltp,
-            trans_type=breakout_direction,
-            order_type=CapitalOrderType.MARKET,
-            timestamp=current_timestamp,
-            stock_data=stock_data
-        )
-        
-        if not base_payload:
-            return
-
-
-        # Add random delay to prevent simultaneous orders
-        await asyncio.sleep(random.uniform(0, 1))
-
-        # Redis key for stock timestamp validation
-        stock_ts_key = f"order:{stock}:{current_timestamp}"
-        if not self.redis_cache.client.setnx(stock_ts_key, 1):
-            return
-        self.redis_cache.client.expire(stock_ts_key, 30)
-
-        if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
-            self.logger.info("HN: Max open trades reached for stock. Skipping.")
-            # self.redis_cache.client.delete(stock_ts_key)
-            # self.redis_cache.client.decr(ts_count_key)
-            return
-
-
-        # Final checks before placing order
-        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("MACD: Max open trades reached. Skipping.")
-            return
-
-        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
-            self.logger.info("MACD: Max loss trades reached. Skipping.")
-            return
-
-        # Prepare indicator values for logging
-        indicator_values = IndicatorValues(
-            rsi=current_rsi,
-            adx=0,  # Not used in this strategy
-            mfi=0   # Not used in this strategy
-        )
-
-        # Send notification
-        await self.send_telegram_notification(
-            final_stock_data,
-            indicator_values,
-            current_price,  # Using current price as broken level
-            base_payload.stop_loss,
-            base_payload.profit_level,
-            breakout_direction,
-            "RSI_MACD_CROSS"
-        )
-
-        # Prepare metadata
-        metadata_json = {
-            "rsi": current_rsi,
-            "macd": current_macd,
-            "macd_signal": current_signal,
-            "strategy": "RSI_MACD_CROSS"
-        }
-
-        # Place order and log trade
-        broken_level = 0
-
-        deal_reference = await self.capital_client.place_order(base_payload)
-        if LOG_TRADE_TO_DB:
-            await self.db_con.log_trade_to_db(
-                final_stock_data,
-                indicator_values,
-                float(broken_level),
-                float(base_payload.stop_distance),
-                float(base_payload.profit_distance),
-                breakout_direction,
-                stock,
-                metadata_json,
-                qty=int(base_payload.quantity),
-                order_status=True if self.test_mode else False,
-                order_ids=[deal_reference] if deal_reference else [],
-                stock_ltp=str(stock_ltp)
-            )
-
-        self.logger.info(
-            f"MACD: Trade executed for {stock}: Direction {breakout_direction.value}, "
-            f"RSI: {current_rsi:.2f}, MACD Cross: {current_macd:.6f}/{current_signal:.6f}"
-        )
 
     async def transform_data_to_15min(self, stock: str, in_data: pd.DataFrame) -> pd.DataFrame:
         """Transform 1-minute data to 15-minute timeframe."""
@@ -1656,136 +1432,6 @@ class StockIndicatorCalculator:
         
         data['stock'] = stock
         return data
-
-
-    async def analyze_sma_strategy_type_2(self, stock) -> None:
-        """
-        Implements a dual-SMA crossover strategy (13-period and 200-period) with additional filter checks.
-        Entry conditions:
-          - BUY when close >= sma13 > sma200 and previously sma13 <= sma200
-          - SELL when close <= sma13 < sma200 and previously sma13 >= sma200
-        Exits and notifications are handled separately.
-        """
-        # 1. Load historical data
-        stock_data = await self.db_con.load_data_from_db(
-            stock,
-            self.end_date - timedelta(days=10),
-            self.end_date
-        )
-        # Require at least 200 bars for SMA200
-        if stock_data.empty or len(stock_data) < 200:
-            return
-
-        stock_data = stock_data.sort_values('timestamp').reset_index(drop=True)
-        final = stock_data.iloc[-1]
-
-        # 2. Handle exits and update open trades status
-        # await self.check_and_execute_exit_trade_type_2(final)
-        # await self.update_open_trades_status(stock_data)
-        # await asyncio.gather(
-        #     self.check_and_execute_exit_trade_type_2(final),
-        #     self.update_open_trades_status(stock_data)
-        # )
-
-        if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
-            self.logger.info("HN: Max open trades reached for stock. Skipping.")
-            # self.redis_cache.client.delete(stock_ts_key)
-            # self.redis_cache.client.decr(ts_count_key)
-            return
-
-
-        # 3. Enforce open/loss limits
-        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
-            self.logger.info("SMA: Max open trades reached. Skipping.")
-            return
-        if await self.db_con.check_loss_trades_count(self.TOTAL_TRADES_LIMIT):
-            self.logger.info("SMA: Max loss trades reached. Skipping.")
-            return
-
-        # 4. Compute SMAs
-        stock_data['sma13'] = stock_data['close'].rolling(window=13).mean()
-        stock_data['sma200'] = stock_data['close'].rolling(window=200).mean()
-
-        # Latest values
-        sma13 = stock_data['sma13'].iloc[-1]
-        sma200 = stock_data['sma200'].iloc[-1]
-        close = final['close']
-
-        # Previous bar values
-        prev_sma13 = stock_data['sma13'].iloc[-2]
-        prev_sma200 = stock_data['sma200'].iloc[-2]
-
-        # 5. Determine entry signal
-        # BUY: sma13 has just crossed above sma200 and price is above sma13
-        buy_cond = (prev_sma13 <= prev_sma200) and (sma13 > sma200) and (close >= sma13)
-        # SELL: sma13 has just crossed below sma200 and price is below sma13
-        sell_cond = (prev_sma13 >= prev_sma200) and (sma13 < sma200) and (close <= sma13)
-
-        if not (buy_cond or sell_cond):
-            return
-
-        # direction = "BUY" if buy_cond else "SELL"
-        direction = CapitalTransactionType.BUY if buy_cond else CapitalTransactionType.SELL
-        level = sma13
-
-        # 6. Fetch current LTP and build order payload
-        stock_ltp = await self.get_stock_ltp(stock, final['ltp'])
-        payload = await self.get_base_payload_for_capital_order(
-            epic=stock,
-            stock_ltp=stock_ltp,
-            trans_type=direction,
-            order_type=CapitalOrderType.MARKET,
-            timestamp=final['timestamp'],
-            stock_data=stock_data
-        )
-        if not payload:
-            return
-
-        # 7. Deduplicate via Redis
-        await asyncio.sleep(random.random())
-        key = f"order:{stock}:{final['timestamp']}"
-        if not self.redis_cache.client.setnx(key, 1):
-            return
-        self.redis_cache.client.expire(key, 30)
-
-        # 8. Calculate additional indicators
-        rsi, adx, mfi = await asyncio.gather(
-            self.calculate_rsi_talib(stock_data),
-            self.calculate_adx_talib(stock_data),
-            self.calculate_mfi_talib(stock_data)
-        )
-
-        # 9. Notify and place order
-        await self.send_telegram_notification(
-            final,
-            IndicatorValues(rsi=rsi, adx=adx, mfi=mfi),
-            level,
-            payload.stop_loss,
-            payload.profit_level,
-            direction,
-            "SMA_STRATEGY_TYPE_2"
-        )
-
-        deal_ref = await self.capital_client.place_order(payload)
-
-        # 10. Log trade
-        if LOG_TRADE_TO_DB:
-            await self.db_con.log_trade_to_db(
-                final,
-                IndicatorValues(rsi=rsi, adx=adx, mfi=mfi),
-                level,
-                payload.stop_loss,
-                payload.profit_level,
-                direction,
-                stock,
-                {"sma13": sma13, "sma200": sma200},
-                qty=int(payload.quantity),
-                order_status=bool(deal_ref),
-                order_ids=[deal_ref] if deal_ref else [],
-                stock_ltp=stock_ltp
-            )
-
-        self.logger.info(f"{stock}: SMA strategy trade executed.")
 
     # 2. MA Crossover Strategy (15-min bars)
     async def analyze_ma_crossover_strategy_type_2(self, symbol) -> None:
@@ -1858,30 +1504,16 @@ class StockIndicatorCalculator:
             return
         self.redis_cache.client.expire(key,30)
 
-        indicator_values = IndicatorValues(rsi=0, adx=0, mfi=0)
-
-        await self.send_telegram_notification(df.iloc[-1], indicator_values, entry,
-                                             payload.stop_loss,
-                                             payload.profit_level,
-                                             payload.transaction_type,
-                                             "MA_CROSSOVER")
-        deal_ref = await self.capital_client.place_order(payload)
-        if LOG_TRADE_TO_DB:
-            await self.db_con.log_trade_to_db(
-                df.iloc[-1],
-                indicator_values,
-                entry,
-                payload.stop_loss,
-                payload.profit_level,
-                direction,
-                symbol,
-                metadata_json=None,
-                qty=payload.quantity,
-                order_status=not self.test_mode,
-                order_ids=[deal_ref] if deal_ref else [],
-                stock_ltp=str(entry)
+        if direction:
+            confidence = 0.7  # Base confidence for MA crossover
+            await self.execute_high_accuracy_trade(
+                stock=symbol,
+                stock_data=df,
+                direction=direction,
+                strategy_name="MA_CROSSOVER",
+                timestamp=now,
+                confidence_level=confidence
             )
-        self.logger.info(f"MA Cross: {symbol} {direction.value} @ {entry:.5f}")
 
     # 3. Mean-Reversion Strategy (15-min bars)
     async def analyze_mean_reversion_strategy(self, symbol) -> None:
@@ -1955,31 +1587,17 @@ class StockIndicatorCalculator:
         
         self.redis_cache.client.expire(key,30)
 
-        indicator_values = IndicatorValues(rsi=0, adx=0, mfi=0)
-
-        await self.send_telegram_notification(df.iloc[-1], indicator_values, entry,
-                                             payload.stop_loss,
-                                             payload.profit_level,
-                                             payload.transaction_type,
-                                             "MEAN_REVERSION")
-        deal_ref = await self.capital_client.place_order(payload)
-        if LOG_TRADE_TO_DB:
-            await self.db_con.log_trade_to_db(
-                df.iloc[-1],
-                indicator_values,
-                float(entry),
-                float(payload.stop_loss),
-                float(payload.profit_level),
-                direction,
-                symbol,
-                metadata_json=None,
-                qty=int(payload.quantity),
-                order_status=not self.test_mode,
-                order_ids=[deal_ref] if deal_ref else [],
-                stock_ltp=str(entry)
+        if direction:
+            confidence = 0.75  # High confidence for mean reversion with multiple confirmations
+            await self.execute_high_accuracy_trade(
+                stock=symbol,
+                stock_data=df,
+                direction=direction,
+                strategy_name="MEAN_REVERSION",
+                timestamp=now,
+                confidence_level=confidence
             )
-        self.logger.info(f"MeanRev: {symbol} {direction.value} @ {entry:.5f}")
-
+            
     async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY', strategy_type: str = None):
         stock = stock_data['stock']
         redis_key = f"message:{stock}"
@@ -2084,8 +1702,6 @@ class StockIndicatorCalculator:
         data['stock'] = stock
         return data
 
-# ############## update_stock_data_v2 implementation
-
     async def update_stock_data_v2(self, data: pd.Series):
         stock = data['stock']
         timestamp = pd.to_datetime(data['timestamp'])
@@ -2101,9 +1717,9 @@ class StockIndicatorCalculator:
         await asyncio.gather(
             self.analyze_smart_money_institutional_v2(stock, timestamp),
             self.analyze_multi_timeframe_alignment_v2(stock, timestamp),
-            self.analyze_supply_demand_zones_enhanced_v2(stock, timestamp),
             # Keep only the most reliable existing strategy
-            self.analyze_reversal_breakout_strategy(stock, timestamp),
+            # self.analyze_orb_fib_strategy(stock, timestamp),
+            self.analyze_reversal_breakout_strategy(stock, timestamp)
         )
 
     async def analyze_smart_money_institutional_v2(self, stock: str, timestamp: datetime) -> None:
@@ -2478,7 +2094,7 @@ class StockIndicatorCalculator:
     async def execute_high_accuracy_trade(self, stock: str, stock_data: pd.DataFrame, 
                                         direction: CapitalTransactionType, 
                                         strategy_name: str, timestamp: datetime,
-                                        confidence_level: float = 0.7) -> None:
+                                        confidence_level: float = 0.7, base_payload: BasicPlaceOrderCapital = None) -> None:
         """
         Execute only high-confidence trades with enhanced risk management
         """
@@ -2501,9 +2117,54 @@ class StockIndicatorCalculator:
 
         current_data = stock_data.iloc[-1]
         stock_ltp = await self.get_stock_ltp(stock, current_data['ltp'])
+
+        # --- Sentiment Analysis Confirmation ---
+        try:
+            symbol_parts = stock.split('.')
+            search_symbol = symbol_parts[2] if len(symbol_parts) > 2 else stock
+            if 'USD' in search_symbol:
+                search_symbol = search_symbol.replace('USD', '')
+        except Exception:
+            search_symbol = stock
+
+        sentiment_result = self.sentiment_trader.get_sentiment_signal(search_symbol)
+        sentiment_signal = sentiment_result.get('signal')
+        sentiment_polarity = sentiment_result.get('weighted_polarity')
+
+        # Determine if sentiment aligns with the trade direction
+        sentiment_aligned = True
+        if direction == CapitalTransactionType.BUY and "BEARISH" in (sentiment_signal or ""):
+            sentiment_aligned = False
+        elif direction == CapitalTransactionType.SELL and "BULLISH" in (sentiment_signal or ""):
+            sentiment_aligned = False
+
+        # Enhanced metadata
+        metadata_json = {
+            "strategy": strategy_name,
+            "confidence": confidence_level,
+            "timestamp": timestamp.isoformat(),
+            "risk_adjusted": True,
+            "sentiment_signal": sentiment_signal,
+            "sentiment_polarity": sentiment_polarity,
+            "sentiment_aligned": sentiment_aligned
+        }
+
+        # If sentiment does not align, log it and do not proceed with the trade
+        if not sentiment_aligned:
+            self.logger.warning(
+                f"Trade for {stock} skipped due to sentiment mismatch. "
+                f"Direction: {direction}, Sentiment: {sentiment_signal}"
+            )
+            # Log the skipped trade for analysis
+            # await self.db_con.insert_trade_data(
+            #     stock=stock, ltp=stock_ltp, cp=0, entry_price=0, sl=0, pl=0, timestamp=timestamp,
+            #     trade_type=direction, status=TradeStatus.SKIPPED, tag=f"{strategy_name}_SENTIMENT_MISMATCH",
+            #     metadata_json=metadata_json
+            # )
+            return
+        # --- End of Sentiment Analysis ---
         
         # Enhanced Redis deduplication with strategy-specific keys
-        # random sleep
         await asyncio.sleep(random.uniform(0, 1))
         strategy_key = f"order:{stock}"
         if not self.redis_cache.client.setnx(strategy_key, 1):
@@ -2516,14 +2177,15 @@ class StockIndicatorCalculator:
         self.stock_per_price_limit = original_limit * min(1.0, confidence_level + 0.2)
 
         try:
-            base_payload = await self.get_base_payload_for_capital_order(
-                epic=stock,
-                stock_ltp=stock_ltp,
-                trans_type=direction,
-                order_type=CapitalOrderType.MARKET,
-                timestamp=timestamp,
-                stock_data=stock_data
-            )
+            if base_payload is None:
+                base_payload = await self.get_base_payload_for_capital_order(
+                    epic=stock,
+                    stock_ltp=stock_ltp,
+                    trans_type=direction,
+                    order_type=CapitalOrderType.MARKET,
+                    timestamp=timestamp,
+                    stock_data=stock_data
+                )
             
             if not base_payload:
                 return
@@ -2536,30 +2198,22 @@ class StockIndicatorCalculator:
             )
             
             indicator_values = IndicatorValues(rsi=rsi, adx=adx, mfi=mfi)
-
-            # Send notification with confidence level
-            await self.send_telegram_notification(
-                current_data,
-                indicator_values,
-                stock_ltp,
-                base_payload.stop_loss,
-                base_payload.profit_level,
-                direction,
-                f"{strategy_name}_CONF:{confidence_level:.2f}"
-            )
-
-            # Enhanced metadata
-            metadata_json = {
-                "strategy": strategy_name,
-                "confidence": confidence_level,
-                "rsi": rsi,
-                "adx": adx,
-                "timestamp": timestamp.isoformat(),
-                "risk_adjusted": True
-            }
+            metadata_json.update({"rsi": rsi, "adx": adx})
 
             # Execute trade
             deal_reference = await self.capital_client.place_order(base_payload)
+
+            # Send notification with confidence level
+            if deal_reference:
+                await self.send_telegram_notification(
+                    current_data,
+                    indicator_values,
+                    stock_ltp,
+                    base_payload.stop_loss,
+                    base_payload.profit_level,
+                    direction,
+                    f"{strategy_name}_CONF:{confidence_level:.2f}"
+                )
             
             if LOG_TRADE_TO_DB:
                 await self.db_con.log_trade_to_db(
@@ -2721,7 +2375,7 @@ class StockIndicatorCalculator:
                 confirmations = await self.get_zone_confirmations(zone, stock_data_15min, direction)
                 
                 # Only trade with sufficient confirmations (adjust threshold as needed)
-                if confirmations >= 3:  # Require 3+ confirmations for high probability
+                if confirmations >= 2:  # Require 3+ confirmations for high probability
                     confidence = 0.6 + (confirmations * 0.1)  # 0.7-0.9 confidence
                     await self.execute_high_accuracy_trade(
                         stock, stock_data_15min, direction, 
@@ -2878,3 +2532,738 @@ class StockIndicatorCalculator:
         else:
             # For sells: look for structure suggesting downward momentum  
             return recent_lows.iloc[-1] < recent_lows.iloc[-2]
+
+
+############## New changes ##############
+
+    async def analyze_sma_strategy_type_1(self, stock) -> None:
+        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(stock, self.end_date - timedelta(days=HISTORY_DATA_PERIOD), self.end_date)
+        if stock_data.empty:
+            return
+        
+        stock_data = stock_data.sort_values(by='timestamp', ascending=True)
+        final_stock_data = stock_data.iloc[-1]
+        current_timestamp = stock_data.iloc[-1]['timestamp']
+        
+        current_price = final_stock_data['ltp']
+        breakout_direction = None
+
+        if stock_data.empty or len(stock_data) < 200:
+            self.logger.info(f"SMA: {stock}: Insufficient data to calculate SMAs. Skipping.")
+            return
+
+        # Calculate 13-period and 200-period SMAs using closing prices
+        stock_data['sma13'] = stock_data['close'].rolling(window=13, min_periods=1).mean()
+        stock_data['sma200'] = stock_data['close'].rolling(window=200, min_periods=1).mean()
+
+        # Extract latest SMA values and closing price
+        sma13 = stock_data['sma13'].iloc[-1]
+        sma200 = stock_data['sma200'].iloc[-1]
+        latest_close = final_stock_data['close']
+        prev_sma13 = stock_data['sma13'].iloc[-2]
+        prev_high = stock_data['high'].iloc[-2]
+        prev_low = stock_data['low'].iloc[-2]
+        prev_high_2 = stock_data['high'].iloc[-3]
+        prev_low_2 = stock_data['low'].iloc[-3]
+        prev_sma13_2 = stock_data['sma13'].iloc[-3]
+        prev_high_3 = stock_data['high'].iloc[-4]
+        prev_low_3 = stock_data['low'].iloc[-4]
+        prev_sma13_3 = stock_data['sma13'].iloc[-4]
+        
+        if pd.isna(sma13) or pd.isna(sma200):
+            self.logger.info(f"SMA: {stock}: Insufficient data to calculate SMAs. Skipping.")
+            return
+
+        breakout_direction = None
+        broken_level = sma13
+
+        if latest_close >= sma13 and latest_close > sma200 and prev_high < prev_sma13 and prev_high_2 < prev_sma13_2 and prev_high_3 < prev_sma13_3:
+            breakout_direction = CapitalTransactionType.BUY
+        elif latest_close <= sma13 and latest_close < sma200 and prev_low > prev_sma13 and prev_low_2 > prev_sma13_2 and prev_low_3 > prev_sma13_3:
+            breakout_direction = CapitalTransactionType.SELL
+        else:
+            self.logger.info(f"SMA: {stock}: Close price not above/below both SMAs. Skipping.")
+            return
+
+        # CONFIRMATION 1: Volume confirmation
+        volume_confirmation = await self._confirm_volume_breakout(stock_data, breakout_direction)
+        if not volume_confirmation:
+            self.logger.info(f"SMA: {stock}: Volume confirmation failed. Skipping.")
+            return
+
+        # CONFIRMATION 2: RSI momentum confirmation
+        rsi_confirmation = await self._confirm_rsi_momentum(stock_data, breakout_direction)
+        if not rsi_confirmation:
+            self.logger.info(f"SMA: {stock}: RSI momentum confirmation failed. Skipping.")
+            return
+
+        # CONFIRMATION 3: Multi-timeframe confirmation
+        mtf_confirmation = await self._confirm_multi_timeframe(stock, breakout_direction, current_timestamp)
+        if not mtf_confirmation:
+            self.logger.info(f"SMA: {stock}: Multi-timeframe confirmation failed. Skipping.")
+            return
+
+        # Determine SL and PL based on breakout direction
+        stock_ltp = await self.get_stock_ltp(stock, current_price)
+        order_type = CapitalOrderType.MARKET
+        base_payload = await self.get_base_payload_for_capital_order(
+            epic=stock,
+            stock_ltp=stock_ltp,
+            trans_type=breakout_direction,
+            order_type=order_type,
+            timestamp=current_timestamp,
+            stock_data=stock_data
+        )
+        
+        if not base_payload:
+            return
+        
+        await asyncio.sleep(random.uniform(0, 1))
+
+        # Redis key for stock timestamp validation
+        stock_ts_key = f"order:{stock}:{current_timestamp}"
+
+        if not self.redis_cache.client.setnx(stock_ts_key, 1):
+            return
+
+        self.redis_cache.client.expire(stock_ts_key, 30)
+
+        if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
+            self.logger.info("HN: Max open trades reached for stock. Skipping.")
+            return
+
+        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+            self.logger.info("SMA: Max open trades reached. Skipping.")
+            return
+
+        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+            self.logger.info("SMA: Max loss trades reached. Skipping.")
+            return
+
+        if breakout_direction:
+            confidence = 0.7  # Base confidence
+            # Increase confidence based on confirmations
+            confirmations = sum([
+                volume_confirmation,
+                rsi_confirmation, 
+                mtf_confirmation
+            ])
+            confidence += confirmations * 0.1
+            
+            await self.execute_high_accuracy_trade(
+                stock=stock,
+                stock_data=stock_data,
+                direction=breakout_direction,
+                strategy_name="SMA_STRATEGY_WITH_CONFIRMATIONS",
+                timestamp=current_timestamp,
+                confidence_level=confidence
+            )
+
+    async def analyze_sma_macd_crossover_strategy(self, stock) -> None:
+        """
+        Implements RSI + MACD crossover strategy on 15-minute timeframes with confirmations.
+        """
+        stock_data: pd.DataFrame = await self.db_con.load_data_from_db(
+            stock, 
+            self.end_date - timedelta(days=5), 
+            self.end_date
+        )
+
+        if stock_data.empty:
+            return
+
+        stock_data = stock_data.sort_values(by='timestamp', ascending=True)
+        final_stock_data = stock_data.iloc[-1]
+        current_timestamp = final_stock_data['timestamp']
+
+        if (current_timestamp + timedelta(minutes=1)).minute % 15 != 0:
+            return
+
+        stock_data_15min = await self.transform_data_to_15min(stock, stock_data)
+        if len(stock_data_15min) < 35:
+            return
+
+        rsi = talib.RSI(stock_data_15min['close'].values, timeperiod=14)
+        macd, signal, hist = talib.MACD(
+            stock_data_15min['close'].values,
+            fastperiod=12,
+            slowperiod=26,
+            signalperiod=9
+        )
+
+        current_rsi = rsi[-1]
+        prev_rsi = rsi[-2]
+        current_macd = macd[-1]
+        current_signal = signal[-1]
+        prev_macd = macd[-2]
+        prev_signal = signal[-2]
+
+        breakout_direction = None
+        if (current_rsi < 30 and prev_rsi < 30 and 
+            current_macd > current_signal and prev_macd <= prev_signal):
+            breakout_direction = CapitalTransactionType.BUY
+        elif (current_rsi > 70 and prev_rsi > 70 and 
+            current_macd < current_signal and prev_macd >= prev_signal):
+            breakout_direction = CapitalTransactionType.SELL
+        else:
+            self.logger.info(f"MACD: {stock}: No valid crossover conditions met. Skipping.")
+            return
+
+        # CONFIRMATION 1: MACD histogram confirmation
+        macd_confirmation = await self._confirm_macd_histogram(hist, breakout_direction)
+        if not macd_confirmation:
+            self.logger.info(f"MACD: {stock}: MACD histogram confirmation failed. Skipping.")
+            return
+
+        # CONFIRMATION 2: Price action confirmation
+        price_action_confirmation = await self._confirm_price_action(stock_data_15min, breakout_direction)
+        if not price_action_confirmation:
+            self.logger.info(f"MACD: {stock}: Price action confirmation failed. Skipping.")
+            return
+
+        # CONFIRMATION 3: Volume divergence confirmation
+        volume_confirmation = await self._confirm_volume_divergence(stock_data_15min, breakout_direction)
+        if not volume_confirmation:
+            self.logger.info(f"MACD: {stock}: Volume divergence confirmation failed. Skipping.")
+            return
+
+        current_price = final_stock_data['ltp']
+        stock_ltp = await self.get_stock_ltp(stock, current_price)
+
+        base_payload = await self.get_base_payload_for_capital_order(
+            epic=stock,
+            stock_ltp=stock_ltp,
+            trans_type=breakout_direction,
+            order_type=CapitalOrderType.MARKET,
+            timestamp=current_timestamp,
+            stock_data=stock_data
+        )
+        
+        if not base_payload:
+            return
+
+        await asyncio.sleep(random.uniform(0, 1))
+
+        stock_ts_key = f"order:{stock}:{current_timestamp}"
+        if not self.redis_cache.client.setnx(stock_ts_key, 1):
+            return
+        self.redis_cache.client.expire(stock_ts_key, 30)
+
+        if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
+            self.logger.info("HN: Max open trades reached for stock. Skipping.")
+            return
+
+        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+            self.logger.info("MACD: Max open trades reached. Skipping.")
+            return
+
+        if await self.db_con.check_loss_trades_count(self.LOSS_TRADE_LIMIT):
+            self.logger.info("MACD: Max loss trades reached. Skipping.")
+            return
+
+        if breakout_direction:
+            confidence = 0.7  # Base confidence
+            confirmations = sum([
+                macd_confirmation,
+                price_action_confirmation,
+                volume_confirmation
+            ])
+            confidence += confirmations * 0.1
+            
+            await self.execute_high_accuracy_trade(
+                stock=stock,
+                stock_data=stock_data_15min,
+                direction=breakout_direction,
+                strategy_name="RSI_MACD_CROSS_WITH_CONFIRMATIONS",
+                timestamp=current_timestamp,
+                confidence_level=confidence
+            )
+
+    async def analyze_sma_strategy_type_2(self, stock) -> None:
+        """
+        Implements a dual-SMA crossover strategy with confirmation mechanisms.
+        """
+        stock_data = await self.db_con.load_data_from_db(
+            stock,
+            self.end_date - timedelta(days=10),
+            self.end_date
+        )
+        
+        if stock_data.empty or len(stock_data) < 200:
+            return
+
+        stock_data = stock_data.sort_values('timestamp').reset_index(drop=True)
+        final = stock_data.iloc[-1]
+
+        if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
+            self.logger.info("HN: Max open trades reached for stock. Skipping.")
+            return
+
+        if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+            self.logger.info("SMA: Max open trades reached. Skipping.")
+            return
+        if await self.db_con.check_loss_trades_count(self.TOTAL_TRADES_LIMIT):
+            self.logger.info("SMA: Max loss trades reached. Skipping.")
+            return
+
+        stock_data['sma13'] = stock_data['close'].rolling(window=13).mean()
+        stock_data['sma200'] = stock_data['close'].rolling(window=200).mean()
+
+        sma13 = stock_data['sma13'].iloc[-1]
+        sma200 = stock_data['sma200'].iloc[-1]
+        close = final['close']
+
+        prev_sma13 = stock_data['sma13'].iloc[-2]
+        prev_sma200 = stock_data['sma200'].iloc[-2]
+
+        buy_cond = (prev_sma13 <= prev_sma200) and (sma13 > sma200) and (close >= sma13)
+        sell_cond = (prev_sma13 >= prev_sma200) and (sma13 < sma200) and (close <= sma13)
+
+        if not (buy_cond or sell_cond):
+            return
+
+        direction = CapitalTransactionType.BUY if buy_cond else CapitalTransactionType.SELL
+        level = sma13
+
+        # CONFIRMATION 1: Candle close confirmation
+        candle_confirmation = await self._confirm_candle_close(stock_data, direction)
+        if not candle_confirmation:
+            self.logger.info(f"SMA Type 2: {stock}: Candle close confirmation failed. Skipping.")
+            return
+
+        # CONFIRMATION 2: ADX trend strength confirmation
+        adx_confirmation = await self._confirm_adx_trend(stock_data, direction)
+        if not adx_confirmation:
+            self.logger.info(f"SMA Type 2: {stock}: ADX trend confirmation failed. Skipping.")
+            return
+
+        # CONFIRMATION 3: Support/Resistance confirmation
+        sr_confirmation = await self._confirm_support_resistance(stock_data, direction)
+        if not sr_confirmation:
+            self.logger.info(f"SMA Type 2: {stock}: Support/Resistance confirmation failed. Skipping.")
+            return
+
+        stock_ltp = await self.get_stock_ltp(stock, final['ltp'])
+        payload = await self.get_base_payload_for_capital_order(
+            epic=stock,
+            stock_ltp=stock_ltp,
+            trans_type=direction,
+            order_type=CapitalOrderType.MARKET,
+            timestamp=final['timestamp'],
+            stock_data=stock_data
+        )
+        if not payload:
+            return
+
+        await asyncio.sleep(random.random())
+        key = f"order:{stock}:{final['timestamp']}"
+        if not self.redis_cache.client.setnx(key, 1):
+            return
+        self.redis_cache.client.expire(key, 30)
+
+        # deal_ref = await self.capital_client.place_order(payload)
+        if direction:
+            confidence = 0.7  # Base confidence
+            confirmations = sum([
+                candle_confirmation,
+                adx_confirmation,
+                sr_confirmation
+            ])
+            confidence += confirmations * 0.1
+            
+            await self.execute_high_accuracy_trade(
+                stock=stock,
+                stock_data=stock_data,
+                direction=direction,
+                strategy_name="SMA_STRATEGY_TYPE_2_WITH_CONFIRMATIONS",
+                timestamp=final['timestamp'],
+                confidence_level=confidence
+            )
+
+    # New confirmation methods
+    async def _confirm_volume_breakout(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm breakout with volume analysis"""
+        if len(stock_data) < 20:
+            return False
+        
+        current_volume = stock_data['volume'].iloc[-1]
+        avg_volume = stock_data['volume'].rolling(20).mean().iloc[-1]
+        
+        # Volume should be above average for breakouts
+        volume_ok = current_volume > avg_volume * 1.2
+        
+        # Volume trend confirmation
+        prev_volume = stock_data['volume'].iloc[-2]
+        volume_trend_ok = current_volume > prev_volume
+        
+        return volume_ok and volume_trend_ok
+
+    async def _confirm_rsi_momentum(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm with RSI momentum"""
+        rsi = await self.calculate_rsi_talib(stock_data)
+        
+        if direction == CapitalTransactionType.BUY:
+            # For buys, RSI should not be overbought and showing upward momentum
+            return 40 <= rsi <= 70
+        else:
+            # For sells, RSI should not be oversold and showing downward momentum
+            return 30 <= rsi <= 60
+
+    async def _confirm_multi_timeframe(self, stock: str, direction: CapitalTransactionType, timestamp: datetime) -> bool:
+        """Confirm with multi-timeframe analysis"""
+        try:
+            # Get 15min and 1hr data for confirmation
+            data_15min = await self.get_transformed_data(stock, timestamp, '15min', days=2)
+            data_1hr = await self.get_transformed_data(stock, timestamp, '1hour', days=3)
+            
+            if data_15min.empty or data_1hr.empty:
+                return False
+            
+            # Check if higher timeframes support the direction
+            if direction == CapitalTransactionType.BUY:
+                tf_confirm = (data_15min['close'].iloc[-1] > data_15min['close'].iloc[-2] and
+                            data_1hr['close'].iloc[-1] > data_1hr['close'].iloc[-2])
+            else:
+                tf_confirm = (data_15min['close'].iloc[-1] < data_15min['close'].iloc[-2] and
+                            data_1hr['close'].iloc[-1] < data_1hr['close'].iloc[-2])
+            
+            return tf_confirm
+        except Exception as e:
+            self.logger.warning(f"Multi-timeframe confirmation error: {e}")
+            return False
+
+    async def _confirm_macd_histogram(self, hist: np.ndarray, direction: CapitalTransactionType) -> bool:
+        """Confirm MACD crossover with histogram analysis"""
+        if len(hist) < 3:
+            return False
+        
+        current_hist = hist[-1]
+        prev_hist = hist[-2]
+        
+        if direction == CapitalTransactionType.BUY:
+            # For buys, histogram should be increasing and positive
+            return current_hist > prev_hist and current_hist > 0
+        else:
+            # For sells, histogram should be decreasing and negative
+            return current_hist < prev_hist and current_hist < 0
+
+    async def _confirm_price_action(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm with price action patterns"""
+        if len(stock_data) < 3:
+            return False
+        
+        current_candle = stock_data.iloc[-1]
+        prev_candle = stock_data.iloc[-2]
+        
+        if direction == CapitalTransactionType.BUY:
+            # Bullish confirmation: current close > previous close and bullish candle
+            return (current_candle['close'] > prev_candle['close'] and
+                    current_candle['close'] > current_candle['open'])
+        else:
+            # Bearish confirmation: current close < previous close and bearish candle
+            return (current_candle['close'] < prev_candle['close'] and
+                    current_candle['close'] < current_candle['open'])
+
+    async def _confirm_volume_divergence(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm with volume divergence analysis"""
+        if len(stock_data) < 10:
+            return False
+        
+        # Check if volume supports the price movement
+        current_volume = stock_data['volume'].iloc[-1]
+        volume_sma = stock_data['volume'].rolling(10).mean().iloc[-1]
+        
+        return current_volume > volume_sma
+
+    async def _confirm_candle_close(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm with candle close position"""
+        current_candle = stock_data.iloc[-1]
+        
+        if direction == CapitalTransactionType.BUY:
+            # For buys, candle should close in the upper half of its range
+            candle_range = current_candle['high'] - current_candle['low']
+            close_position = (current_candle['close'] - current_candle['low']) / candle_range
+            return close_position > 0.5
+        else:
+            # For sells, candle should close in the lower half of its range
+            candle_range = current_candle['high'] - current_candle['low']
+            close_position = (current_candle['close'] - current_candle['low']) / candle_range
+            return close_position < 0.5
+
+    async def _confirm_adx_trend(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm with ADX trend strength"""
+        adx = await self.calculate_adx_talib(stock_data)
+        
+        # ADX should show strong trend (above 20)
+        return adx > 20
+
+    async def _confirm_support_resistance(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """Confirm with support/resistance levels"""
+        support_levels, resistance_levels = await self.calculate_pivot_data(stock_data)
+        
+        current_price = stock_data['close'].iloc[-1]
+        
+        if direction == CapitalTransactionType.BUY:
+            # For buys, price should be above key support levels
+            if support_levels:
+                nearest_support = max([s for s in support_levels if s < current_price], default=None)
+                return nearest_support is not None and current_price > nearest_support * 1.005
+        else:
+            # For sells, price should be below key resistance levels
+            if resistance_levels:
+                nearest_resistance = min([r for r in resistance_levels if r > current_price], default=None)
+                return nearest_resistance is not None and current_price < nearest_resistance * 0.995
+        
+        return True  # If no levels found, don't reject the trade
+
+    # Add this new strategy method to your StockIndicatorCalculator class
+
+    async def analyze_orb_fib_strategy(self, stock: str, timestamp: datetime) -> None:
+        """
+        ORB + Fibonacci Strategy with MACD Confirmation
+        Steps:
+        1. Identify opening range (first 15-30 minutes)
+        2. Wait for breakout of OR high/low
+        3. Wait for pullback to 50% or 61.8% Fib level
+        4. Confirm with MACD bullish/bearish divergence
+        5. Enter with tight stop loss below 78.6% level
+        """
+        try:
+            # Get market details for opening time
+            market_config = self.market_details.get(stock, {})
+            if not market_config:
+                self.logger.warning(f"No market config found for {stock}")
+                return
+
+            # Get current day's data
+            stock_data = await self.db_con.load_data_from_db_with_timestamp(
+                stock, timestamp.date(), timestamp
+            )
+            if stock_data.empty:
+                return
+
+            # Transform to 5-minute data for analysis
+            stock_data_5min = await self.transform_1_min_data_to_5_min_data(stock, stock_data)
+            if stock_data_5min.empty:
+                return
+
+            # Get market open time
+            market_open_str = market_config.get('open', '09:15')
+            market_open_time = datetime.strptime(market_open_str, "%H:%M").time()
+            
+            # Create datetime for market open
+            market_open_dt = datetime.combine(timestamp.date(), market_open_time)
+            if stock_data_5min['timestamp'].iloc[0].tzinfo:
+                market_open_dt = pytz.timezone('Asia/Kolkata').localize(market_open_dt)
+
+            # Calculate opening range (first 30 minutes)
+            opening_range_end = market_open_dt + timedelta(minutes=30)
+            opening_range_data = stock_data_5min[
+                (stock_data_5min['timestamp'] >= market_open_dt) & 
+                (stock_data_5min['timestamp'] <= opening_range_end)
+            ]
+
+            if opening_range_data.empty:
+                return
+
+            # Calculate OR high and low
+            orb_high = opening_range_data['high'].max()
+            orb_low = opening_range_data['low'].min()
+            
+            self.logger.info(f"ORB {stock}: OR High: {orb_high:.2f}, OR Low: {orb_low:.2f}")
+
+            # Get data after opening range for breakout detection
+            post_or_data = stock_data_5min[stock_data_5min['timestamp'] > opening_range_end]
+            if post_or_data.empty:
+                return
+
+            # Check for breakout
+            breakout_direction = None
+            breakout_price = None
+            breakout_time = None
+
+            for idx, row in post_or_data.iterrows():
+                if row['high'] > orb_high and not breakout_direction:
+                    breakout_direction = CapitalTransactionType.BUY
+                    breakout_price = orb_high
+                    breakout_time = row['timestamp']
+                    self.logger.info(f"ORB {stock}: Bullish breakout detected at {breakout_time}")
+                    break
+                elif row['low'] < orb_low and not breakout_direction:
+                    breakout_direction = CapitalTransactionType.SELL
+                    breakout_price = orb_low
+                    breakout_time = row['timestamp']
+                    self.logger.info(f"ORB {stock}: Bearish breakout detected at {breakout_time}")
+                    break
+
+            if not breakout_direction:
+                return
+
+            # Get data after breakout for pullback analysis
+            post_breakout_data = post_or_data[post_or_data['timestamp'] > breakout_time]
+            if post_breakout_data.empty:
+                return
+
+            # Calculate Fibonacci levels based on breakout move
+            if breakout_direction == CapitalTransactionType.BUY:
+                # For bullish breakout: low = OR low, high = breakout level
+                move_low = orb_low
+                move_high = breakout_price
+            else:
+                # For bearish breakout: high = OR high, low = breakout level
+                move_high = orb_high
+                move_low = breakout_price
+
+            move_range = move_high - move_low
+            
+            # Calculate Fibonacci levels
+            fib_levels = {
+                '0': move_high if breakout_direction == CapitalTransactionType.BUY else move_low,
+                '23.6': move_high - move_range * 0.236 if breakout_direction == CapitalTransactionType.BUY else move_low + move_range * 0.236,
+                '38.2': move_high - move_range * 0.382 if breakout_direction == CapitalTransactionType.BUY else move_low + move_range * 0.382,
+                '50': move_high - move_range * 0.5 if breakout_direction == CapitalTransactionType.BUY else move_low + move_range * 0.5,
+                '61.8': move_high - move_range * 0.618 if breakout_direction == CapitalTransactionType.BUY else move_low + move_range * 0.618,
+                '78.6': move_high - move_range * 0.786 if breakout_direction == CapitalTransactionType.BUY else move_low + move_range * 0.786,
+                '100': move_low if breakout_direction == CapitalTransactionType.BUY else move_high
+            }
+
+            self.logger.info(f"ORB {stock}: Fib Levels - 50%: {fib_levels['50']:.2f}, 61.8%: {fib_levels['61.8']:.2f}")
+
+            # Look for pullback to 50% or 61.8% level
+            current_data = post_breakout_data.iloc[-1]
+            current_price = current_data['close']
+            current_low = current_data['low']
+            current_high = current_data['high']
+
+            # Check if price has pulled back to fib levels
+            fib_entry_level = None
+            if breakout_direction == CapitalTransactionType.BUY:
+                # For long, look for pullback to support levels
+                if current_low <= fib_levels['61.8'] <= current_high:
+                    fib_entry_level = fib_levels['61.8']
+                elif current_low <= fib_levels['50'] <= current_high:
+                    fib_entry_level = fib_levels['50']
+            else:
+                # For short, look for pullback to resistance levels
+                if current_low <= fib_levels['61.8'] <= current_high:
+                    fib_entry_level = fib_levels['61.8']
+                elif current_low <= fib_levels['50'] <= current_high:
+                    fib_entry_level = fib_levels['50']
+
+            if not fib_entry_level:
+                return
+
+            self.logger.info(f"ORB {stock}: Pullback to Fib level {fib_entry_level:.2f} detected")
+
+            # MACD Confirmation
+            macd_confirmation = await self._check_macd_confirmation(stock_data_5min, breakout_direction)
+            if not macd_confirmation:
+                self.logger.info(f"ORB {stock}: MACD confirmation failed")
+                return
+
+            # Check if we're at the exact fib level (current candle touches the level)
+            entry_price = fib_entry_level
+            stock_ltp = await self.get_stock_ltp(stock, entry_price)
+
+            # Prepare order with custom SL at 78.6% level
+            base_payload = await self.get_base_payload_for_capital_order(
+                epic=stock,
+                stock_ltp=stock_ltp,
+                trans_type=breakout_direction,
+                order_type=CapitalOrderType.LIMIT,  # Use limit order for precise entry
+                timestamp=timestamp,
+                stock_data=stock_data
+            )
+
+            if not base_payload:
+                return
+
+            # Override SL to use 78.6% Fib level
+            if breakout_direction == CapitalTransactionType.BUY:
+                base_payload.stop_loss = fib_levels['78.6'] * 0.999  # Slightly below for safety
+            else:
+                base_payload.stop_loss = fib_levels['78.6'] * 1.001  # Slightly above for safety
+
+            # Calculate profit target (aim for new high/low of the day)
+            if breakout_direction == CapitalTransactionType.BUY:
+                day_high = stock_data_5min['high'].max()
+                base_payload.profit_level = day_high * 1.01  # 1% above day high
+            else:
+                day_low = stock_data_5min['low'].min()
+                base_payload.profit_level = day_low * 0.99  # 1% below day low
+
+            # Risk management checks
+            await asyncio.sleep(random.uniform(0, 1))
+
+            stock_ts_key = f"orb:{stock}:{timestamp}"
+            if not self.redis_cache.client.setnx(stock_ts_key, 1):
+                return
+            self.redis_cache.client.expire(stock_ts_key, 30)
+
+            if await self.db_con.check_stock_trades_count(stock, self.STOCK_TRADE_LIMIT):
+                self.logger.info(f"ORB {stock}: Max open trades reached for stock")
+                return
+
+            if await self.db_con.check_open_trades_count(self.OPEN_TRADES_LIMIT):
+                self.logger.info(f"ORB {stock}: Max open trades reached")
+                return
+
+            # Execute trade with high confidence
+            confidence = 0.8  # High confidence for ORB + Fib + MACD
+            await self.execute_high_accuracy_trade(
+                stock=stock,
+                stock_data=stock_data_5min,
+                direction=breakout_direction,
+                strategy_name="ORB_FIB_STRATEGY",
+                timestamp=timestamp,
+                confidence_level=confidence,
+                base_payload=base_payload
+            )
+
+            self.logger.info(f"ORB {stock}: Trade executed - Direction: {breakout_direction.value}, "
+                            f"Entry: {entry_price:.2f}, SL: {base_payload.stop_loss:.2f}, "
+                            f"TP: {base_payload.profit_level:.2f}")
+
+        except Exception as e:
+            self.logger.error(f"ORB strategy error for {stock}: {str(e)}")
+
+    async def _check_macd_confirmation(self, stock_data: pd.DataFrame, direction: CapitalTransactionType) -> bool:
+        """
+        Check MACD confirmation for ORB + Fib strategy
+        For long: MACD showing bullish divergence or curling up from midline
+        For short: MACD showing bearish divergence or curling down from midline
+        """
+        if len(stock_data) < 26:  # Need enough data for MACD
+            return False
+
+        try:
+            # Calculate MACD
+            closes = stock_data['close'].values
+            macd, signal, histogram = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)
+            
+            if len(macd) < 2 or np.isnan(macd[-1]) or np.isnan(macd[-2]):
+                return False
+
+            current_macd = macd[-1]
+            previous_macd = macd[-2]
+            current_histogram = histogram[-1]
+            previous_histogram = histogram[-2]
+
+            if direction == CapitalTransactionType.BUY:
+                # Bullish confirmation: MACD curling up or histogram increasing
+                bullish_histogram = current_histogram > previous_histogram
+                bullish_macd = current_macd > previous_macd
+                above_zero = current_macd > 0
+                
+                return (bullish_histogram or bullish_macd) and above_zero
+            else:
+                # Bearish confirmation: MACD curling down or histogram decreasing
+                bearish_histogram = current_histogram < previous_histogram
+                bearish_macd = current_macd < previous_macd
+                below_zero = current_macd < 0
+                
+                return (bearish_histogram or bearish_macd) and below_zero
+
+        except Exception as e:
+            self.logger.warning(f"MACD confirmation error: {str(e)}")
+            return False

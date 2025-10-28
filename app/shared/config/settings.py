@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     SL_PERC: float = 0.004  # 1% stop loss
     LOG_TRADE_TO_DB: bool = False
     RISK_REWARD_RATIO: float = 1.2
+    THE_NEWS_API_KEY: Optional[str] = None
 
 
     class Config:

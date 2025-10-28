@@ -6,8 +6,8 @@
         "weekend_trading": false,
         "holidays": [],
         "leverage": "200:1",
-        "sl_perc": 0.0025,
-        "qty": "250",
+        "sl_perc": 0.0015,
+        "qty": "100",
         "orb_enabled": false
     },
     "US100": {
@@ -40,8 +40,8 @@
         "holidays": [],
         "leverage": "200:1",
         "sl": "7.5",
-        "sl_perc": 0.0025,
-        "qty": "4",
+        "sl_perc": 0.0020,
+        "qty": "2",
         "orb_enabled": true
     },
     "J225": {
@@ -73,7 +73,7 @@
         ],
         "leverage": "200:1",
         "sl_perc": 0.0025,
-        "qty": "50",
+        "qty": "30",
         "orb_enabled": false
     },
     "US30": {
@@ -108,7 +108,7 @@
         "holidays": [],
         "leverage": "20:1",
         "sl_perc": 0.0025,
-        "qty": "0.013",
+        "qty": "0.130",
         "orb_enabled": false
     },
     "ETHUSD": {
