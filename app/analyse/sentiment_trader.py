@@ -911,6 +911,8 @@ class SentimentTrader:
 def main():
     """Standalone testing function"""
     import sys
+    import time as time_module
+    start_time = time_module.time()
     UI_INSTRUMENTS = os.getenv("UI_INSTRUMENTS", "")
     if UI_INSTRUMENTS:
         symbol = UI_INSTRUMENTS.split(",")
@@ -933,22 +935,23 @@ def main():
             return
     
     # Test with caching
-    print("\n🧪 Testing with caching enabled:")
-    for s in symbol:
-        result = sentiment_trader.get_sentiment_signal(s, max_queries=3, use_cache=False)
-        sentiment_trader.print_detailed_analysis(s, result)
+    # print("\n🧪 Testing with caching enabled:")
+    # for s in symbol:
+    #     result = sentiment_trader.get_sentiment_signal(s, max_queries=1, use_cache=False)
+    #     sentiment_trader.print_detailed_analysis(s, result)
     
     # Test cache hit
     print("\n🧪 Testing cache hit (same request):")
     for s in symbol:
-        result = sentiment_trader.get_sentiment_signal(s, max_queries=3, use_cache=True)
+        result = sentiment_trader.get_sentiment_signal(s, max_queries=1, use_cache=True)
         sentiment_trader.print_detailed_analysis(s, result)
     
     # Test cache clearing
-    print("\n🧪 Testing cache clearing:")
-    sentiment_trader.clear_cache(symbol[0])
+    # print("\n🧪 Testing cache clearing:")
+    # sentiment_trader.clear_cache(symbol[0])
     cache_info = sentiment_trader.get_cache_info()
     print(f"📊 Cache Status after clearing: {cache_info}")
-
+    end_time = time_module.time()
+    print(f"Sentiment analysis took {end_time - start_time:.2f} seconds")
 if __name__ == "__main__":
     main()

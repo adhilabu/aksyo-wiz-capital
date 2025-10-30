@@ -1,4 +1,5 @@
 import asyncio
+import time as time_module
 from datetime import date, datetime, time, timedelta
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 import json
@@ -2127,9 +2128,12 @@ class StockIndicatorCalculator:
         except Exception:
             search_symbol = stock
 
-        sentiment_result = self.sentiment_trader.get_sentiment_signal(search_symbol)
+        start_time = time_module.time()
+        sentiment_result = self.sentiment_trader.get_sentiment_signal(search_symbol, max_queries=1)
         sentiment_signal = sentiment_result.get('signal')
         sentiment_polarity = sentiment_result.get('weighted_polarity')
+        end_time = time_module.time()
+        self.logger.info(f"Sentiment analysis for {stock} took {end_time - start_time:.2f} seconds")
 
         # Determine if sentiment aligns with the trade direction
         sentiment_aligned = True
@@ -2212,7 +2216,7 @@ class StockIndicatorCalculator:
                     base_payload.stop_loss,
                     base_payload.profit_level,
                     direction,
-                    f"{strategy_name}_CONF:{confidence_level:.2f}"
+                    f"{strategy_name}_CONF:{confidence_level:.2f}:sentiment_signal:{sentiment_signal}"
                 )
             
             if LOG_TRADE_TO_DB:
