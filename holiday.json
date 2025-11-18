@@ -1,18 +1,18 @@
 {
     "OIL_CRUDE": {
         "open": "22:00",
-        "close": "21:59",
+        "close": "21:00",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
         "leverage": "200:1",
-        "sl_perc": 0.0015,
-        "qty": "100",
+        "sl_perc": 0.0013,
+        "qty": "150",
         "orb_enabled": false
     },
     "US100": {
-        "open": "00:00",
-        "close": "23:59",
+        "open": "02:35",
+        "close": "02:30",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [
@@ -34,7 +34,7 @@
     },
     "GOLD": {
         "open": "03:30",
-        "close": "02:29",
+        "close": "02:30",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
@@ -45,8 +45,8 @@
         "orb_enabled": true
     },
     "J225": {
-        "open": "00:00",
-        "close": "23:59",
+        "open": "21:00",
+        "close": "21:05",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [
@@ -107,8 +107,8 @@
         "weekend_trading": true,
         "holidays": [],
         "leverage": "20:1",
-        "sl_perc": 0.0025,
-        "qty": "0.130",
+        "sl_perc": 0.0003,
+        "qty": "0.05",
         "orb_enabled": false
     },
     "ETHUSD": {
@@ -123,8 +123,8 @@
         "orb_enabled": false
     },
     "USCOCOA": {
-        "open": "00:00",
-        "close": "23:59",
+        "open": "15:10",
+        "close": "00:00",
         "timezone": "UTC",
         "weekend_trading": false,
         "holidays": [],
@@ -140,8 +140,8 @@
         "weekend_trading": false,
         "holidays": [],
         "leverage": "200:1",
-        "sl_perc": 0.0025,
-        "qty": "15000",
+        "sl_perc": 0.0015,
+        "qty": "20000",
         "orb_enabled": false
     },
     "EURJPY": {
@@ -151,8 +151,8 @@
         "weekend_trading": false,
         "holidays": [],
         "leverage": "200:1",
-        "sl_perc": 0.0025,
-        "qty": "13000",
+        "sl_perc": 0.0015,
+        "qty": "20000",
         "orb_enabled": false
     }
 }

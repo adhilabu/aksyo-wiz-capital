@@ -26,6 +26,7 @@ class SentimentTrader:
     
     def __init__(self):
         self.api_key = os.getenv("THE_NEWS_API_KEY")
+        self.api_key_2 = os.getenv("THE_NEWS_API_KEY_2")
         self.logger = logging.getLogger(__name__)
         
         # Initialize Redis client
@@ -295,7 +296,7 @@ class SentimentTrader:
         except Exception as e:
             return {"status": f"Error: {str(e)}"}
 
-    def get_sentiment_signal(self, symbol: str, days_back: int = 4, max_queries: int = 3, 
+    def get_sentiment_signal(self, symbol: str, days_back: int = 1, max_queries: int = 3, 
                            use_cache: bool = True) -> Dict[str, any]:
         """
         Main method to get sentiment signal for trading integration with Redis caching
@@ -943,7 +944,7 @@ def main():
     # Test cache hit
     print("\n🧪 Testing cache hit (same request):")
     for s in symbol:
-        result = sentiment_trader.get_sentiment_signal(s, max_queries=1, use_cache=True)
+        result = sentiment_trader.get_sentiment_signal(s, max_queries=2, use_cache=True)
         sentiment_trader.print_detailed_analysis(s, result)
     
     # Test cache clearing

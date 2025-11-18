@@ -41,6 +41,7 @@ TRADE_PERC = float(os.getenv("TRADE_PERC", 0.006))
 SL_PERC = float(os.getenv("SL_PERC", 0.01))
 RISK_REWARD_RATIO = float(os.getenv("RISK_REWARD_RATIO", 1.2))
 LOG_TRADE_TO_DB = os.getenv("LOG_TRADE_TO_DB", "False").lower() == "true"
+QTY_MULTIPLIER = float(os.getenv("QTY_MULTIPLIER", "2"))
 LOG_TRADE_TO_DB = CAPITAL_SETTINGS.LOG_TRADE_TO_DB
 
 print(f"Trade Analysis Type: {TRADE_ANALYSIS_TYPE}")
@@ -51,10 +52,11 @@ class StockIndicatorCalculator:
     TRADE_PERC = TRADE_PERC
     SL_PERC = SL_PERC
     MAX_ADJUSTMENTS = 3
-    TOTAL_TRADES_LIMIT = 40
-    OPEN_TRADES_LIMIT = 15
+    TOTAL_TRADES_LIMIT = 20
+    OPEN_TRADES_LIMIT = 5
     LOSS_TRADE_LIMIT = 5
-    STOCK_TRADE_LIMIT = 5
+    STOCK_TRADE_LIMIT = 1
+    QTY_MULTIPLIER = QTY_MULTIPLIER    
 
     def __init__(self, db_connection: DBConnection, redis_cache: RedisCache, start_date=None, end_date=None, test_mode=False):
         self.db_con: DBConnection = db_connection
@@ -857,8 +859,10 @@ class StockIndicatorCalculator:
 
     async def get_or_calculate_reversal_data(self, stock_symbol, stock_data_5_min):
         # if cached already, skip recalculation
-        if stock_symbol in self.stock_reversal_data:
-            return False, self.stock_reversal_data[stock_symbol]
+        self.logger.info(f"Checking cache for {stock_symbol}")
+        current_day_stock_symbol = stock_symbol + "_" + stock_data_5_min['timestamp'].iloc[-1].date().strftime("%Y%m%d")
+        if current_day_stock_symbol in self.stock_reversal_data:
+            return False, self.stock_reversal_data[current_day_stock_symbol]
 
         # load market open info (all times in UTC)
         open_str = self.market_details[stock_symbol]['open']    # e.g. "13:30" UTC
@@ -895,7 +899,7 @@ class StockIndicatorCalculator:
         # attempt to load stored reversal data
         db_data = await self.db_con.get_reversal_data(stock_symbol, relevant_date, 'stock')
         if db_data:
-            self.stock_reversal_data[stock_symbol] = db_data
+            self.stock_reversal_data[current_day_stock_symbol] = db_data
             return False, db_data
 
         # compute reversal on filtered bars
@@ -903,7 +907,7 @@ class StockIndicatorCalculator:
         if reversal_data:
             rh, rl, rt = reversal_data
             await self.db_con.save_reversal_data(stock_symbol, relevant_date, rh, rl, rt, 'stock')
-            self.stock_reversal_data[stock_symbol] = reversal_data
+            self.stock_reversal_data[current_day_stock_symbol] = reversal_data
             return True, reversal_data
 
         # no reversal found
@@ -1161,7 +1165,7 @@ class StockIndicatorCalculator:
             self.logger.warning(f"Calculated quantity is zero or negative for {epic} at LTP {stock_ltp}. Skipping order.")
             return None
         # Apply min/max constraints and round to the nearest valid increment
-        quantity = initial_quantity
+        quantity = initial_quantity * self.QTY_MULTIPLIER
 
         # 1. Enforce min and max deal size
         if quantity < market_details.min_deal_size:
@@ -1277,18 +1281,24 @@ class StockIndicatorCalculator:
             return
         
         reversal_high, reversal_low, reversal_time = reversal_data
+        self.logger.info(f"Reversal data for {stock}: {reversal_data} : Current timestamp {stock_data_5_min['timestamp'].iloc[-1]}")
         current_timestamp = stock_data_5_min['timestamp'].iloc[-1]
         if reversal_time == current_timestamp:
             return
         
+        # Get all data after reversal INCLUDING current candle
         post_reversal_data = stock_data_5_min[
             (stock_data_5_min['timestamp'] > reversal_time) & 
-            (stock_data_5_min['timestamp'] < current_timestamp)
+            (stock_data_5_min['timestamp'] <= current_timestamp)
         ]
         
-        current_price = final_stock_data['ltp']
-        breakout_direction = CapitalTransactionType.BUY
-        broken_level = reversal_high
+        # Use 5-min close price for breakout detection (more reliable than 1-min LTP)
+        current_5min_candle = stock_data_5_min.iloc[-1]
+        current_price = current_5min_candle['close']
+        
+        # Determine breakout direction based on current 5-min close
+        breakout_direction = None
+        broken_level = None
         
         if current_price > reversal_high:
             breakout_direction = CapitalTransactionType.BUY
@@ -1297,18 +1307,21 @@ class StockIndicatorCalculator:
             breakout_direction = CapitalTransactionType.SELL
             broken_level = reversal_low
         else:
+            # Current price is still within reversal range, no breakout yet
             return
         
+        # Check if breakout already occurred in PREVIOUS candles (not current)
+        previous_post_reversal_data = stock_data_5_min[
+            (stock_data_5_min['timestamp'] > reversal_time) & 
+            (stock_data_5_min['timestamp'] < current_timestamp)
+        ]
+        
         already_broken = False
-        if not post_reversal_data.empty:
+        if not previous_post_reversal_data.empty:
             if breakout_direction == CapitalTransactionType.BUY:
-                already_broken = (post_reversal_data['close'] > reversal_high).any()
+                already_broken = (previous_post_reversal_data['close'] > reversal_high).any()
             else:
-                already_broken = (post_reversal_data['close'] < reversal_low).any()
-
-
-        # Mark breakout as executed for today
-        # self.executed_breakouts[stock] = True
+                already_broken = (previous_post_reversal_data['close'] < reversal_low).any()
 
         if already_broken:
             self.logger.info(f"{stock}: Breakout already occurred in historical data. Skipping.")
@@ -2129,18 +2142,18 @@ class StockIndicatorCalculator:
             search_symbol = stock
 
         start_time = time_module.time()
-        sentiment_result = self.sentiment_trader.get_sentiment_signal(search_symbol, max_queries=1)
+        sentiment_result = self.sentiment_trader.get_sentiment_signal(search_symbol, max_queries=1, days_back=2)
         sentiment_signal = sentiment_result.get('signal')
         sentiment_polarity = sentiment_result.get('weighted_polarity')
         end_time = time_module.time()
         self.logger.info(f"Sentiment analysis for {stock} took {end_time - start_time:.2f} seconds")
 
         # Determine if sentiment aligns with the trade direction
-        sentiment_aligned = True
-        if direction == CapitalTransactionType.BUY and "BEARISH" in (sentiment_signal or ""):
-            sentiment_aligned = False
-        elif direction == CapitalTransactionType.SELL and "BULLISH" in (sentiment_signal or ""):
-            sentiment_aligned = False
+        sentiment_aligned = False
+        if direction == CapitalTransactionType.BUY and "BULLISH" in (sentiment_signal or ""):
+            sentiment_aligned = True
+        elif direction == CapitalTransactionType.SELL and "BEARISH" in (sentiment_signal or ""):
+            sentiment_aligned = True
 
         # Enhanced metadata
         metadata_json = {
