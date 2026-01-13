@@ -39,7 +39,7 @@
         "weekend_trading": false,
         "holidays": [],
         "leverage": "200:1",
-        "sl": "7.5",
+        "sl": "0.0015",
         "sl_perc": 0.0020,
         "qty": "2",
         "orb_enabled": true
@@ -130,7 +130,7 @@
         "holidays": [],
         "leverage": "200:1",
         "sl_perc": 0.0025,
-        "qty": "1.25",
+        "qty": "0.3",
         "orb_enabled": true
     },
     "USDJPY": {

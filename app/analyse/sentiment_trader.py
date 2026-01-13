@@ -762,6 +762,7 @@ class SentimentTrader:
                 'subjectivity': round(subjectivity, 3),
                 'confidence': round(confidence, 3),
                 'source': article.get('source', 'Unknown'),
+                'url': article.get('url', ''),
                 'search_query': article.get('search_query', 'Unknown'),
                 'published_at': article.get('published_at', '')[:16],
                 'instrument_type': instrument_type

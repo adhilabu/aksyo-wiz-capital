@@ -1612,13 +1612,22 @@ class StockIndicatorCalculator:
                 confidence_level=confidence
             )
             
-    async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY', strategy_type: str = None):
+    async def send_telegram_notification(self, stock_data: pd.Series, indicator_values: IndicatorValues, broken_level, sl, pl, trade_type: str = 'BUY', strategy_type: str = None, articles: list = None):
         stock = stock_data['stock']
         redis_key = f"message:{stock}"
         stock_name = self.stock_name_map.get(stock, stock)
         formatted_date_time = stock_data['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
         ist_timezone = pytz.timezone('Asia/Kolkata')
         current_time = datetime.now(ist_timezone).strftime("%Y-%m-%d %H:%M:%S")
+
+        articles_text = ""
+        if articles:
+            articles_text = "\n\nAnalyze News:"
+            for article in articles[:3]:
+                title = article.get('title', 'No Title')
+                url = article.get('url', '')
+                articles_text += f"\n• {title}\n  {url}"
+
         if self.test_mode:
             message = (
                 "Test Mode\n"
@@ -1635,6 +1644,9 @@ class StockIndicatorCalculator:
                 f"Stock Date & Time: {formatted_date_time}\n"
                 f"MSG Date & Time: {current_time}"
             )
+
+            if articles_text:
+                message += articles_text
 
             if TELEGRAM_NOTIFICATION.lower() == "true":
                 telegram_api = TelegramAPI(TELEGRAM_TOKEN)
@@ -1660,6 +1672,9 @@ class StockIndicatorCalculator:
             f"Stock Date & Time: {formatted_date_time}\n"
             f"MSG Date & Time: {current_time}"
         )
+
+        if articles_text:
+            message += articles_text
 
         with open(self.filename, "a") as f:
             f.write(f"{message}\n\n")
@@ -2145,6 +2160,7 @@ class StockIndicatorCalculator:
         sentiment_result = self.sentiment_trader.get_sentiment_signal(search_symbol, max_queries=1, days_back=2)
         sentiment_signal = sentiment_result.get('signal')
         sentiment_polarity = sentiment_result.get('weighted_polarity')
+        sentiment_articles = sentiment_result.get('sentiment_df')
         end_time = time_module.time()
         self.logger.info(f"Sentiment analysis for {stock} took {end_time - start_time:.2f} seconds")
 
@@ -2229,7 +2245,8 @@ class StockIndicatorCalculator:
                     base_payload.stop_loss,
                     base_payload.profit_level,
                     direction,
-                    f"{strategy_name}_CONF:{confidence_level:.2f}:sentiment_signal:{sentiment_signal}"
+                    f"{strategy_name}_CONF:{confidence_level:.2f}:sentiment_signal:{sentiment_signal}",
+                    articles=sentiment_articles
                 )
             
             if LOG_TRADE_TO_DB:
