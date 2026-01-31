@@ -41,7 +41,7 @@ TRADE_PERC = float(os.getenv("TRADE_PERC", 0.006))
 SL_PERC = float(os.getenv("SL_PERC", 0.01))
 RISK_REWARD_RATIO = float(os.getenv("RISK_REWARD_RATIO", 1.2))
 LOG_TRADE_TO_DB = os.getenv("LOG_TRADE_TO_DB", "False").lower() == "true"
-QTY_MULTIPLIER = float(os.getenv("QTY_MULTIPLIER", "2"))
+QTY_MULTIPLIER = float(os.getenv("QTY_MULTIPLIER", "1"))
 LOG_TRADE_TO_DB = CAPITAL_SETTINGS.LOG_TRADE_TO_DB
 
 print(f"Trade Analysis Type: {TRADE_ANALYSIS_TYPE}")

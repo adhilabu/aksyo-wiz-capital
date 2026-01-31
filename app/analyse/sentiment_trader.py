@@ -1,5 +1,4 @@
 import requests
-from textblob import TextBlob
 import pandas as pd
 from datetime import datetime, timedelta
 import os
@@ -31,6 +30,41 @@ class SentimentTrader:
         
         # Initialize Redis client
         self.redis_client = self._init_redis()
+        
+        # Initialize OpenAI client (primary sentiment analyzer)
+        self.openai_client = None
+        self.openai_available = False
+        try:
+            from openai import OpenAI
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            if openai_api_key:
+                self.openai_client = OpenAI(api_key=openai_api_key)
+                self.openai_available = True
+                self.logger.info("OpenAI client initialized successfully")
+            else:
+                self.logger.warning("OPENAI_API_KEY not found. OpenAI sentiment analysis disabled.")
+        except ImportError:
+            self.logger.warning("OpenAI library not installed. Run: pip install openai")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize OpenAI client: {e}")
+        
+        # Initialize Gemini client (backup sentiment analyzer)
+        self.gemini_model = None
+        self.gemini_available = False
+        try:
+            import google.generativeai as genai
+            gemini_api_key = os.getenv("GEMINI_API_KEY")
+            if gemini_api_key:
+                genai.configure(api_key=gemini_api_key)
+                self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+                self.gemini_available = True
+                self.logger.info("Gemini client initialized successfully")
+            else:
+                self.logger.warning("GEMINI_API_KEY not found. Gemini sentiment analysis disabled.")
+        except ImportError:
+            self.logger.warning("Google Generative AI library not installed. Run: pip install google-generativeai")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize Gemini client: {e}")
         
         # Enhanced instrument search queries with better targeting
         self.instrument_search_queries = {
@@ -315,6 +349,7 @@ class SentimentTrader:
         
         # Try to get from cache first
         if use_cache:
+            print("symbol :", symbol, "use_cache :", use_cache)
             cached_result = self._get_cached_result(cache_key)
             if cached_result:
                 # Add cache hit indicator
@@ -323,8 +358,10 @@ class SentimentTrader:
                 return cached_result
         
         try:
+            print("Fetching news for symbol :", symbol)
             # Fetch market-relevant articles from multiple queries
             articles = self._fetch_news(symbol, days_back, max_queries)
+            print("Articles  :", articles)
             
             if not articles:
                 self.logger.warning(f"No quality market analysis found for {symbol}")
@@ -712,6 +749,242 @@ class SentimentTrader:
                 
         return False
 
+    def _analyze_sentiment_with_openai(self, text: str, instrument_type: str) -> Dict:
+        """
+        Analyze sentiment using OpenAI GPT API
+        
+        Args:
+            text: Article text to analyze
+            instrument_type: Type of instrument (crypto, indices, commodities, forex)
+            
+        Returns:
+            Dict with sentiment, polarity, confidence, and reasoning
+        """
+        if not self.openai_available:
+            raise Exception("OpenAI client not available")
+        
+        prompt = f"""You are a financial market sentiment analyzer specializing in {instrument_type} markets.
+Analyze the following news article and provide sentiment analysis for trading purposes.
+
+Article: {text}
+
+Provide your analysis in JSON format with:
+- sentiment: one of "BULLISH", "BEARISH", or "NEUTRAL"
+- polarity: a float between -1.0 (very bearish) and 1.0 (very bullish)
+- confidence: a float between 0.0 and 1.0 indicating analysis confidence
+- reasoning: brief explanation (1-2 sentences) of why you classified it this way
+
+Consider:
+- Market-moving events and their impact
+- Tone and language used
+- Magnitude of predicted price movements
+- Relevance to {instrument_type} trading
+
+Respond ONLY with valid JSON, no other text."""
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a financial sentiment analysis expert. Always respond with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=300
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            # Parse JSON response
+            result = json.loads(result_text)
+            
+            # Validate required fields
+            required_fields = ['sentiment', 'polarity', 'confidence']
+            if not all(field in result for field in required_fields):
+                raise ValueError(f"Missing required fields in OpenAI response: {result}")
+            
+            # Normalize sentiment to uppercase
+            result['sentiment'] = result['sentiment'].upper()
+            
+            # Ensure polarity and confidence are in valid ranges
+            result['polarity'] = max(-1.0, min(1.0, float(result['polarity'])))
+            result['confidence'] = max(0.0, min(1.0, float(result['confidence'])))
+            
+            self.logger.info(f"OpenAI sentiment analysis successful: {result['sentiment']}")
+            return result
+            
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse OpenAI JSON response: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"OpenAI API error: {e}")
+            raise
+
+    def _analyze_sentiment_with_gemini(self, text: str, instrument_type: str) -> Dict:
+        """
+        Analyze sentiment using Google Gemini API (fallback)
+        
+        Args:
+            text: Article text to analyze
+            instrument_type: Type of instrument (crypto, indices, commodities, forex)
+            
+        Returns:
+            Dict with sentiment, polarity, confidence, and reasoning
+        """
+        if not self.gemini_available:
+            raise Exception("Gemini client not available")
+        
+        prompt = f"""You are a financial market sentiment analyzer specializing in {instrument_type} markets.
+Analyze the following news article and provide sentiment analysis for trading purposes.
+
+Article: {text}
+
+Provide your analysis in JSON format with:
+- sentiment: one of "BULLISH", "BEARISH", or "NEUTRAL"
+- polarity: a float between -1.0 (very bearish) and 1.0 (very bullish)
+- confidence: a float between 0.0 and 1.0 indicating analysis confidence
+- reasoning: brief explanation (1-2 sentences) of why you classified it this way
+
+Consider:
+- Market-moving events and their impact
+- Tone and language used
+- Magnitude of predicted price movements
+- Relevance to {instrument_type} trading
+
+Respond ONLY with valid JSON, no other text."""
+
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            result_text = response.text.strip()
+            
+            # Remove markdown code blocks if present
+            if result_text.startswith('```'):
+                result_text = result_text.split('```')[1]
+                if result_text.startswith('json'):
+                    result_text = result_text[4:]
+                result_text = result_text.strip()
+            
+            # Parse JSON response
+            result = json.loads(result_text)
+            
+            # Validate required fields
+            required_fields = ['sentiment', 'polarity', 'confidence']
+            if not all(field in result for field in required_fields):
+                raise ValueError(f"Missing required fields in Gemini response: {result}")
+            
+            # Normalize sentiment to uppercase
+            result['sentiment'] = result['sentiment'].upper()
+            
+            # Ensure polarity and confidence are in valid ranges
+            result['polarity'] = max(-1.0, min(1.0, float(result['polarity'])))
+            result['confidence'] = max(0.0, min(1.0, float(result['confidence'])))
+            
+            self.logger.info(f"Gemini sentiment analysis successful: {result['sentiment']}")
+            return result
+            
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse Gemini JSON response: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Gemini API error: {e}")
+            raise
+
+    def _analyze_sentiment_with_llm(self, text: str, instrument_type: str) -> Dict:
+        """
+        Analyze sentiment using LLM with fallback chain: OpenAI -> Gemini -> Keyword-based
+        
+        Args:
+            text: Article text to analyze
+            instrument_type: Type of instrument (crypto, indices, commodities, forex)
+            
+        Returns:
+            Dict with sentiment, polarity, confidence, reasoning, and analyzer_used
+        """
+        # Try OpenAI first
+        if self.openai_available:
+            print("Using OpenAI for sentiment analysis")
+            try:
+                result = self._analyze_sentiment_with_openai(text, instrument_type)
+                result['analyzer_used'] = 'openai'
+                print("OpenAI analysis successful")
+                print(result)
+                return result
+            except Exception as e:
+                self.logger.warning(f"OpenAI analysis failed, trying Gemini fallback: {e}")
+        
+        # Fall back to Gemini
+        if self.gemini_available:
+            try:
+                result = self._analyze_sentiment_with_gemini(text, instrument_type)
+                result['analyzer_used'] = 'gemini'
+                print("Gemini analysis successful")
+                print(result)
+                return result
+            except Exception as e:
+                self.logger.warning(f"Gemini analysis failed, using keyword-based fallback: {e}")
+        
+        # Final fallback: simple keyword-based analysis
+        self.logger.info("Using keyword-based sentiment analysis fallback")
+        return self._analyze_sentiment_keyword_based(text, instrument_type)
+
+    def _analyze_sentiment_keyword_based(self, text: str, instrument_type: str) -> Dict:
+        """
+        Simple keyword-based sentiment analysis as final fallback
+        
+        Args:
+            text: Article text to analyze
+            instrument_type: Type of instrument
+            
+        Returns:
+            Dict with sentiment, polarity, confidence, and reasoning
+        """
+        # Get relevant terms for instrument type
+        general_terms = self.sentiment_indicators['general']
+        specific_terms = self.sentiment_indicators.get(instrument_type, {})
+        
+        all_bullish = general_terms['bullish_terms'] + specific_terms.get('bullish_terms', [])
+        all_bearish = general_terms['bearish_terms'] + specific_terms.get('bearish_terms', [])
+        
+        # Count occurrences
+        text_lower = text.lower()
+        bullish_count = sum(1 for term in all_bullish if term in text_lower)
+        bearish_count = sum(1 for term in all_bearish if term in text_lower)
+        
+        total_terms = bullish_count + bearish_count
+        
+        if total_terms == 0:
+            return {
+                'sentiment': 'NEUTRAL',
+                'polarity': 0.0,
+                'confidence': 0.3,
+                'reasoning': 'No significant market sentiment indicators found',
+                'analyzer_used': 'keyword_fallback'
+            }
+        
+        # Calculate polarity
+        polarity = (bullish_count - bearish_count) / total_terms
+        polarity = polarity * 0.7  # Scale down to be more conservative
+        
+        # Determine sentiment
+        if polarity > 0.2:
+            sentiment = 'BULLISH'
+        elif polarity < -0.2:
+            sentiment = 'BEARISH'
+        else:
+            sentiment = 'NEUTRAL'
+        
+        # Calculate confidence based on term count
+        confidence = min(total_terms * 0.1, 0.6)  # Cap at 0.6 for keyword-based
+        
+        return {
+            'sentiment': sentiment,
+            'polarity': polarity,
+            'confidence': confidence,
+            'reasoning': f'Keyword analysis: {bullish_count} bullish, {bearish_count} bearish indicators',
+            'analyzer_used': 'keyword_fallback'
+        }
+
+
     def _analyze_market_sentiment(self, articles: List[Dict], symbol: str) -> pd.DataFrame:
         """
         Analyzes sentiment with instrument-specific context.
@@ -723,34 +996,48 @@ class SentimentTrader:
             title = article.get('title', '')
             description = article.get('description', '')
             snippet = article.get('snippet', '')
-            text = f"{title}. {description}. {snippet}".lower()
+            text = f"{title}. {description}. {snippet}"
             
             # Skip if text is too short for meaningful analysis
             if len(text.strip()) < 20:
                 continue
-                
-            # TextBlob sentiment
+            
+            # Use LLM-based sentiment analysis (OpenAI -> Gemini -> Keyword fallback)
             try:
-                analysis = TextBlob(text)
-                polarity = analysis.sentiment.polarity
-                subjectivity = analysis.sentiment.subjectivity
+                llm_result = self._analyze_sentiment_with_llm(text, instrument_type)
+                
+                # Extract results from LLM analysis
+                polarity = llm_result['polarity']
+                confidence = llm_result['confidence']
+                sentiment_label = llm_result['sentiment']
+                reasoning = llm_result.get('reasoning', '')
+                analyzer_used = llm_result.get('analyzer_used', 'unknown')
+                
+                # Market context adjustment for hybrid approach (optional enhancement)
+                market_context_score = self._calculate_market_context(text.lower(), instrument_type)
+                
+                # Adjusted polarity with market context (blend LLM with keyword signals)
+                adjusted_polarity = polarity + (market_context_score * 0.2)  # 20% weight to context
+                adjusted_polarity = max(min(adjusted_polarity, 1.0), -1.0)
+                
+                # Re-classify sentiment based on adjusted polarity if significantly different
+                if abs(adjusted_polarity - polarity) > 0.15:
+                    sentiment_label, trade_sentiment = self._classify_sentiment(adjusted_polarity)
+                else:
+                    # Map LLM sentiment to trade sentiment
+                    trade_sentiment = sentiment_label if sentiment_label in ['BULLISH', 'BEARISH', 'NEUTRAL'] else 'NEUTRAL'
+                
             except Exception as e:
-                self.logger.warning(f"TextBlob analysis failed: {e}")
+                self.logger.error(f"LLM sentiment analysis failed completely: {e}")
+                # Ultimate fallback
                 polarity = 0.0
-                subjectivity = 0.5
-            
-            # Market context adjustment with instrument-specific terms
-            market_context_score = self._calculate_market_context(text, instrument_type)
-            
-            # Adjusted polarity with market context
-            adjusted_polarity = polarity + market_context_score
-            adjusted_polarity = max(min(adjusted_polarity, 1.0), -1.0)
-            
-            # Enhanced sentiment classification for trading
-            sentiment_label, trade_sentiment = self._classify_sentiment(adjusted_polarity)
-            
-            # Confidence based on subjectivity and market terms
-            confidence = self._calculate_confidence(adjusted_polarity, subjectivity, text, instrument_type)
+                adjusted_polarity = 0.0
+                sentiment_label = 'NEUTRAL'
+                trade_sentiment = 'NEUTRAL'
+                confidence = 0.1
+                reasoning = f'Analysis failed: {str(e)[:50]}'
+                analyzer_used = 'error_fallback'
+                market_context_score = 0.0
             
             sentiments.append({
                 'title': title[:80] + '...' if len(title) > 80 else title,
@@ -758,9 +1045,10 @@ class SentimentTrader:
                 'trade_sentiment': trade_sentiment,
                 'polarity': round(adjusted_polarity, 3),
                 'raw_polarity': round(polarity, 3),
-                'market_context': market_context_score,
-                'subjectivity': round(subjectivity, 3),
+                'market_context': round(market_context_score, 3),
                 'confidence': round(confidence, 3),
+                'reasoning': reasoning[:100] if reasoning else '',
+                'analyzer_used': analyzer_used,
                 'source': article.get('source', 'Unknown'),
                 'url': article.get('url', ''),
                 'search_query': article.get('search_query', 'Unknown'),
@@ -931,10 +1219,7 @@ def main():
     
     for s in symbol:
         if s not in sentiment_trader.get_available_instruments():
-            print(f"❌ Instrument {s} not supported. Available instruments:")
-            for inst in sentiment_trader.get_available_instruments():
-                print(f"   - {inst}")
-            return
+            print(f"❌ Instrument {s} not available")
     
     # Test with caching
     # print("\n🧪 Testing with caching enabled:")
@@ -945,7 +1230,8 @@ def main():
     # Test cache hit
     print("\n🧪 Testing cache hit (same request):")
     for s in symbol:
-        result = sentiment_trader.get_sentiment_signal(s, max_queries=2, use_cache=True)
+        print("symbol", s)
+        result = sentiment_trader.get_sentiment_signal(s, max_queries=1, use_cache=True)
         sentiment_trader.print_detailed_analysis(s, result)
     
     # Test cache clearing

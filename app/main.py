@@ -24,6 +24,7 @@ TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION", "false")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CAPITAL_API_BASE_URL = os.getenv("CAPITAL_API_BASE_URL", "")
+UI_INSTRUMENTS = os.getenv("UI_INSTRUMENTS", "")
 
 message = (
     f"Aksyo - Capital Strategy strarted with the following configuration:\n"
@@ -33,6 +34,7 @@ message = (
     f"- Consumer Count: {CONSUMER_COUNT}\n"
     f"- Trade Analysis Type: {TRADE_ANALYSIS_TYPE}\n"
     f"- Capital API Base URL: {CAPITAL_API_BASE_URL}\n"
+    f"- Current UI Instruments: {UI_INSTRUMENTS}\n"
 )
 
 if TELEGRAM_NOTIFICATION.lower() == "true":

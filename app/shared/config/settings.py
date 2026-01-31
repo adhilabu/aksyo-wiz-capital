@@ -53,7 +53,9 @@ class Settings(BaseSettings):
     RISK_REWARD_RATIO: float = 1.2
     THE_NEWS_API_KEY: Optional[str] = None
     THE_NEWS_API_KEY_2: Optional[str] = None
-    QTY_MULTIPLIER: float = 1.5
+    QTY_MULTIPLIER: float = 1
+    OPENAI_API_KEY: Optional[str] = None
+    GEMINI_API_KEY: Optional[str] = None
 
 
     class Config:
