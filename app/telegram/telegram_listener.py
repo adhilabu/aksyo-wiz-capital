@@ -14,9 +14,37 @@ from app.telegram.signal_parser import SignalParser
 from app.telegram.signal_processor import SignalProcessor
 from app.database.db import DBConnection
 from dotenv import load_dotenv
+from app.notification.telegram import TelegramAPI
 
 logger = logging.getLogger(__name__)
 load_dotenv(dotenv_path=".env", override=True)
+PULSAR_URL = os.getenv("PULSAR_URL")
+PULSAR_TOPIC = os.getenv("PULSAR_TOPIC")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_NOTIFICATION = os.getenv("TELEGRAM_NOTIFICATION")
+
+SPLIT_TYPE = os.getenv("SPLIT_TYPE")
+CONSUMER_COUNT = os.getenv("CONSUMER_COUNT")
+TRADE_ANALYSIS_TYPE = os.getenv("TRADE_ANALYSIS_TYPE")
+CAPITAL_API_BASE_URL = os.getenv("CAPITAL_API_BASE_URL")
+UI_INSTRUMENTS = os.getenv("UI_INSTRUMENTS")
+
+message = (
+    f"Aksyo - Capital Telegram Listener started with the following configuration:\n"
+    f"- Pulsar URL: {PULSAR_URL}\n"
+    f"- Pulsar Topic: {PULSAR_TOPIC}\n"
+    f"- Split Type: {SPLIT_TYPE}\n"
+    f"- Consumer Count: {CONSUMER_COUNT}\n"
+    f"- Trade Analysis Type: {TRADE_ANALYSIS_TYPE}\n"
+    f"- Capital API Base URL: {CAPITAL_API_BASE_URL}\n"
+    f"- Current UI Instruments: {UI_INSTRUMENTS}\n"
+)
+
+if TELEGRAM_NOTIFICATION.lower() == "true":
+    telegram_api = TelegramAPI(TELEGRAM_TOKEN)
+    telegram_api.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+
 
 class TelegramSignalListener:
     """
