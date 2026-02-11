@@ -5,15 +5,17 @@ import math
 from typing import Optional
 import asyncpg
 import os
-
+from dotenv import load_dotenv
 import pandas as pd
 import pytz
 
 from app.analyse.schemas import CapitalMarketDetails, IndicatorValues
 from app.capital.schemas import CapitalTransactionType
 
-DATABASE_URL = os.getenv('DATABASE_URL', '')
+load_dotenv(dotenv_path=".env")
 
+DATABASE_URL = os.getenv('DATABASE_URL', '')
+print('DATABASE_URL', DATABASE_URL)
 class DBConnection:
     def __init__(self, start_date: Optional[date] = None, end_date: Optional[date] = None):
         self.pool = None

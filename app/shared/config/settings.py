@@ -56,7 +56,16 @@ class Settings(BaseSettings):
     QTY_MULTIPLIER: float = 1
     OPENAI_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
-
+    TELEGRAM_API_ID: Optional[str] = None
+    TELEGRAM_API_HASH: Optional[str] = None
+    TELEGRAM_PHONE_NUMBER: Optional[str] = None
+    TELEGRAM_SOURCE_CHANNEL: Optional[str] = None
+    TELEGRAM_CHAT_ID: Optional[str] = None
+    TELEGRAM_TOKEN: Optional[str] = None
+    MIN_CONFIDENCE_STARS: int = 3
+    ENABLE_AUTO_TRADING: bool = True
+    MAX_POSITION_SIZE: int = 100
+    RISK_PER_TRADE_DOLLARS: float = 50.0  # Dollar amount to risk per trade (recommended: 40-60)
 
     class Config:
         env_file = ".env"

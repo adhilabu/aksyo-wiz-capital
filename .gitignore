@@ -29,3 +29,8 @@ fno_instruments_cache.pkl
 venv_dp/bin_d/python
 venv_dp/bin_d/python3.12
 aksyo-capital.pid
+telegram_listen.txt
+telegram_listener.pid
+telegram_session.session
+telegram_session.session-journal
+historical_exports/*
