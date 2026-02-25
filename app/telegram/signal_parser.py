@@ -8,6 +8,7 @@ import re
 import logging
 import json
 import os
+from app.capital.schemas import CapitalOrderType
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,7 @@ class TradingSignal:
     """Structured representation of a trading signal from Telegram."""
     instrument: str  # e.g., "US100", "CHINA50"
     direction: str   # "BUY" or "SELL"
+    order_type: CapitalOrderType
     entry_price: float
     stop_loss: float
     target_1: float
@@ -100,6 +102,15 @@ class SignalParser:
                 raise ValueError("Missing instrument")
             instrument = instrument_match.group(1)
             
+            # Determine order type
+            order_type = CapitalOrderType.MARKET
+            if "Limit" in message_text and ("Buy Limit" in message_text or "Sell Limit" in message_text):
+                order_type = CapitalOrderType.LIMIT
+            elif "Limit" in message_text:
+                 # Fallback/Safety: If "Limit" is mentioned but not in standard format, 
+                 # force OpenAI fallback to understand context
+                 raise ValueError("Ambiguous Limit order detected - triggering OpenAI fallback")
+            
             # Extract direction
             direction = SignalParser._parse_direction(message_text)
             if not direction:
@@ -151,6 +162,7 @@ class SignalParser:
             signal = TradingSignal(
                 instrument=instrument,
                 direction=direction,
+                order_type=order_type,
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 target_1=target_1,
@@ -211,6 +223,7 @@ class SignalParser:
   "target_1": number,
   "target_2": number,
   "confidence": number (1-5, count the stars),
+  "order_type": "MARKET or LIMIT",
   "expires_at": "YYYY-MM-DD HH:MM format"
 }}
 
@@ -220,6 +233,7 @@ Message:
 Rules:
 - Extract the instrument name (e.g., US100, XAU/USD, GOLD)
 - Direction is BUY or SELL based on the message
+- Determine Order Type (MARKET or LIMIT) based on the context (e.g. "Buy Limit", "Sell Limit", or "Limit at"). Default to MARKET.
 - All prices must be numbers
 - Confidence is the number of stars (⭐)
 - If any field is missing, return null for that field
@@ -248,6 +262,8 @@ Rules:
             
             # Validate all required fields are present
             required_fields = ["instrument", "direction", "entry_price", "stop_loss", "target_1", "target_2", "confidence", "expires_at"]
+            # order_type is optional in JSON extract, default to MARKET if missing
+
             if not all(data.get(field) is not None for field in required_fields):
                 logger.warning(f"OpenAI extraction missing required fields: {data}")
                 return None
@@ -258,6 +274,7 @@ Rules:
             signal = TradingSignal(
                 instrument=str(data["instrument"]).upper().replace("/", ""),
                 direction=str(data["direction"]).upper(),
+                order_type=CapitalOrderType[data.get("order_type", "MARKET").upper()],
                 entry_price=float(data["entry_price"]),
                 stop_loss=float(data["stop_loss"]),
                 target_1=float(data["target_1"]),

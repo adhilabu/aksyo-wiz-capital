@@ -14,6 +14,9 @@ from app.telegram.instrument_mapper import InstrumentMapper
 from app.capital.actions import CapitalAPI
 from app.capital.schemas import BasicPlaceOrderCapital, CapitalOrderType, CapitalTransactionType
 from app.database.db import DBConnection
+from app.redis.redis import RedisCache
+from app.shared.config.settings import CAPITAL_SETTINGS
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 load_dotenv(dotenv_path=".env", override=True)
@@ -53,6 +56,19 @@ class SignalProcessor:
         # Load market details from holiday.json
         self.market_details = {}
         self._load_market_details()
+
+        # Initialize Redis Cache
+        try:
+            redis_url = urlparse(CAPITAL_SETTINGS.REDIS_URL)
+            self.redis_cache = RedisCache(
+                host=redis_url.hostname,
+                port=redis_url.port or 6379,
+                db=int(redis_url.path.lstrip('/')) if redis_url.path else 0
+            )
+            logger.info(f"Redis cache initialized connected to {redis_url.hostname}:{redis_url.port}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Redis cache: {e}")
+            self.redis_cache = None
         
         logger.info(f"SignalProcessor initialized - Auto-trading: {self.enable_auto_trading}, Risk per trade: ${self.risk_per_trade_dollars}, QTY multiplier: {self.qty_multiplier}")
     
@@ -133,6 +149,15 @@ class SignalProcessor:
             
             # Step 4: Execute trade if enabled
             if self.enable_auto_trading:
+                # Redis duplicate check
+                redis_key = f"trade_lock:{epic}:{signal.direction}"
+                if self.redis_cache and self.redis_cache.key_exists(redis_key):
+                    logger.warning(f"Skipping order for {epic} {signal.direction} - order executed within last hour")
+                    result["status"] = "skipped_duplicate"
+                    result["reason"] = f"Duplicate order attempt within 1 hour for {epic} {signal.direction}"
+                    await self._log_signal(signal, result)
+                    return result
+
                 logger.info(f"Executing trade: {epic} {signal.direction} size={position_size}")
                 order = await self._create_order(signal, epic, position_size)
                 
@@ -142,6 +167,11 @@ class SignalProcessor:
                     result["status"] = "executed"
                     result["reason"] = f"Trade executed: {deal_reference}"
                     logger.info(f"Trade executed successfully: {deal_reference}")
+
+                    # Set Redis lock for 1 hour (3600 seconds)
+                    if self.redis_cache:
+                        self.redis_cache.set_key(redis_key, "1", ttl=3600)
+                        logger.info(f"Set Redis lock for {redis_key} (1 hour)")
                 except Exception as e:
                     result["status"] = "failed"
                     result["error"] = str(e)
@@ -625,9 +655,9 @@ Respond in JSON format:
             
             order = BasicPlaceOrderCapital(
                 quantity=quantity,
-                price=None,  # None for MARKET orders
+                price=signal.entry_price if signal.order_type == CapitalOrderType.LIMIT else None,
                 epic=epic,
-                order_type=CapitalOrderType.MARKET,
+                order_type=signal.order_type,
                 transaction_type=direction,
                 stop_loss=stop_level,
                 profit_level=profit_level,

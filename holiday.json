@@ -8,7 +8,7 @@
         "leverage": "200:1",
         "sl": "0.004",
         "sl_perc": 0.004,
-        "qty": "50",
+        "qty": "25",
         "orb_enabled": false
     },
     "US100": {

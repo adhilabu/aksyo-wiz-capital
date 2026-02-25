@@ -9,7 +9,7 @@ from app.analyse.schemas import CapitalMarketDetails
 from app.database.db import DBConnection
 from app.capital.capital_com import CapitalComAPI
 from app.capital.schemas import BasicPlaceOrderCapital, CapitalOrderType, CapitalTransactionType, CapitalMarketResolution
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import logging
 import yfinance as yf
@@ -156,6 +156,8 @@ class CapitalAPI:
 
     def _map_order_to_working_order_payload(self, basic_order: BasicPlaceOrderCapital) -> dict:
         """Maps the internal order schema to the Capital.com API payload for creating a working order (LIMIT/STOP)."""
+        # Set expiry to 1 day from now in UTC, as required by Capital.com (YYYY-MM-DDTHH:MM:SS)
+        expiry_utc = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
         payload = {
             "epic": basic_order.epic,
             "direction": basic_order.transaction_type.value,
@@ -163,6 +165,7 @@ class CapitalAPI:
             "level": basic_order.price, # The price for LIMIT/STOP
             "type": basic_order.order_type.value,
             "guaranteedStop": False,
+            "goodTillDate": expiry_utc,  # Order expires 1 day from placement
         }
         if basic_order.stop_distance:
             payload["stopDistance"] = basic_order.stop_distance
